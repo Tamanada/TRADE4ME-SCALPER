@@ -316,20 +316,22 @@ def run_scalper(live: bool = False):
                             signal.take_profit,
                         )
 
-                # ── FIB MARTINGALE ─────────────────────────────
-                # Check for red 15m candle → create new session
-                if not fib.active_session:
-                    red_candle = fib.detect_red_candle(dfs["15m"])
+                # ── FIB MARTINGALE — scan all 3 TF ────────────
+                for tf in TIMEFRAMES:
+                    if fib.active_sessions.get(tf) is not None:
+                        continue  # already has active session on this TF
+                    red_candle = fib.detect_red_candle(dfs[tf])
                     if red_candle:
-                        session = fib.create_session(red_candle["high"], red_candle["low"])
+                        session = fib.create_session(red_candle["high"], red_candle["low"], tf)
                         console.print(
-                            f"\n  [bold magenta]FIB SESSION[/bold magenta] "
-                            f"Red candle: ${red_candle['high']:,.2f} → ${red_candle['low']:,.2f} "
-                            f"(range: {red_candle['range_pct']:.2f}%)"
+                            f"\n  [bold magenta]FIB [{tf}][/bold magenta] "
+                            f"Red candle: ${red_candle['high']:,.2f} -> ${red_candle['low']:,.2f} "
+                            f"(range: {red_candle['range_pct']:.2f}%) "
+                            f"capital: ${fib.capital_per_tf:.2f}"
                         )
                         for o in session.orders:
                             console.print(
-                                f"    Fib {o.fib_level:.3f} → ${o.price:,.2f} → buy ${o.amount_usdt:.2f}",
+                                f"    Fib {o.fib_level:.3f} -> ${o.price:,.2f} -> buy ${o.amount_usdt:.2f}",
                                 highlight=False,
                             )
                         console.print(
@@ -337,40 +339,37 @@ def run_scalper(live: bool = False):
                             f"SL: [red]${session.stop_loss:,.2f}[/red]\n"
                         )
 
-                # Check fills on active session
-                if fib.active_session:
-                    fills = fib.check_fills(current_price)
-                    for f_order in fills:
-                        console.print(
-                            f"  [bold magenta]FIB FILL[/bold magenta] "
-                            f"Fib {f_order.fib_level:.3f} @ ${current_price:,.2f} "
-                            f"→ ${f_order.amount_usdt:.2f} | "
-                            f"Total: ${fib.active_session.total_invested:.2f} "
-                            f"avg: ${fib.active_session.avg_entry:,.2f}"
-                        )
+                # Check fills on all active sessions
+                fills = fib.check_fills(current_price)
+                for f_order in fills:
+                    console.print(
+                        f"  [bold magenta]FIB FILL[/bold magenta] "
+                        f"Fib {f_order.fib_level:.3f} @ ${f_order.fill_price:,.2f} "
+                        f"-> ${f_order.amount_usdt:.2f}"
+                    )
 
-                    # Check TP/SL
-                    exit_info = fib.check_exit(current_price)
-                    if exit_info:
-                        pnl_style = "green" if exit_info["pnl"] >= 0 else "red"
-                        console.print(
-                            f"\n  [bold magenta]FIB {exit_info['reason']}[/bold magenta] "
-                            f"@ ${exit_info['exit_price']:,.2f} | "
-                            f"[{pnl_style}]P&L: ${exit_info['pnl']:+,.2f}[/{pnl_style}] | "
-                            f"Invested: ${exit_info['invested']:.2f} | "
-                            f"Fills: {exit_info['fills']}\n"
-                        )
+                # Check TP/SL on all sessions
+                exits = fib.check_exit(current_price)
+                for exit_info in exits:
+                    pnl_style = "green" if exit_info["pnl"] >= 0 else "red"
+                    console.print(
+                        f"\n  [bold magenta]FIB {exit_info['reason']} [{exit_info['tf']}][/bold magenta] "
+                        f"@ ${exit_info['exit_price']:,.2f} | "
+                        f"[{pnl_style}]P&L: ${exit_info['pnl']:+,.2f}[/{pnl_style}] | "
+                        f"Invested: ${exit_info['invested']:.2f} | "
+                        f"Fills: {exit_info['fills']}\n"
+                    )
 
-                    # Show Fib status every 10 scans
-                    if scan_count % 10 == 0:
-                        status = fib.get_status(current_price)
-                        if status["active"]:
-                            upnl = status["unrealized_pnl"]
+                # Show Fib status every 10 scans
+                if scan_count % 10 == 0:
+                    status = fib.get_status(current_price)
+                    if status["active"]:
+                        for tf, s in status["sessions"].items():
+                            upnl = s["unrealized_pnl"]
                             upnl_style = "green" if upnl >= 0 else "red"
                             console.print(
-                                f"  [magenta]FIB: {status['fills']}/{status['total_orders']} fills | "
-                                f"Invested: ${status['invested']:.2f} | "
-                                f"Avg: ${status['avg_entry']:,.2f} | "
+                                f"  [magenta]FIB [{tf}]: {s['fills']}/{s['total_orders']} fills | "
+                                f"${s['invested']:.2f} | avg ${s['avg_entry']:,.2f} | "
                                 f"uP&L: [{upnl_style}]${upnl:+,.2f}[/{upnl_style}][/magenta]"
                             )
 
