@@ -99,9 +99,22 @@ def print_signal(signal, scan_count: int):
     bull = ind.get("bull_score", 0)
     bear = ind.get("bear_score", 0)
 
+    # RSI vs SMA for each TF
+    rsi_tf = ""
+    for tf_key in ["15m", "5m", "1m"]:
+        tf_ind = signal.indicators.get(tf_key, {})
+        r = tf_ind.get("rsi", 50)
+        s = tf_ind.get("rsi_sma", 50)
+        if r > s:
+            rsi_tf += "[green]↑[/green]"
+        elif r < s:
+            rsi_tf += "[red]↓[/red]"
+        else:
+            rsi_tf += "[yellow]-[/yellow]"
+
     # Main line
     console.print(
-        f"  [{now}] #{scan_count} | 15m:{tf_15m} 5m:{tf_5m} 1m:{tf_1m} | "
+        f"  [{now}] #{scan_count} | 15m:{tf_15m} 5m:{tf_5m} 1m:{tf_1m} | RSI:{rsi_tf} | "
         f"{stoch} {wr} {mfi_v} {crsi_v} {rsi_v} {bb_v} | "
         f"[green]B:{bull}[/green]/[red]S:{bear}[/red]",
         highlight=False,

@@ -201,9 +201,28 @@ class MultiTFScalpStrategy:
 
         price = df_1m.iloc[-1]["close"] if len(df_1m) > 0 else 0
 
-        # All 3 timeframes must agree
-        all_long = dir_15m == Direction.LONG and dir_5m == Direction.LONG and dir_1m == Direction.LONG
-        all_short = dir_15m == Direction.SHORT and dir_5m == Direction.SHORT and dir_1m == Direction.SHORT
+        # ── RSI vs Smooth RSI cross-timeframe filter ──────
+        # RSI > Smooth RSI on ALL timeframes = bullish confirmation
+        # RSI < Smooth RSI on ALL timeframes = bearish confirmation
+        def rsi_trend(df):
+            if len(df) < 2: return "neutral"
+            c = df.iloc[-1]
+            rsi = c.get("rsi", 50)
+            sma = c.get("rsi_sma", 50)
+            if rsi > sma: return "bull"
+            if rsi < sma: return "bear"
+            return "neutral"
+
+        rsi_15m = rsi_trend(df_15m)
+        rsi_5m = rsi_trend(df_5m)
+        rsi_1m = rsi_trend(df_1m)
+
+        rsi_all_bull = rsi_15m == "bull" and rsi_5m == "bull" and rsi_1m == "bull"
+        rsi_all_bear = rsi_15m == "bear" and rsi_5m == "bear" and rsi_1m == "bear"
+
+        # All 3 timeframes must agree on indicators AND RSI trend
+        all_long = dir_15m == Direction.LONG and dir_5m == Direction.LONG and dir_1m == Direction.LONG and rsi_all_bull
+        all_short = dir_15m == Direction.SHORT and dir_5m == Direction.SHORT and dir_1m == Direction.SHORT and rsi_all_bear
 
         if all_long:
             strength = (score_15m + score_5m + score_1m) / 21  # max 7*3=21
@@ -215,7 +234,7 @@ class MultiTFScalpStrategy:
                 entry_price=price,
                 stop_loss=sl,
                 take_profit=tp,
-                reason=f"LONG: 15m({score_15m}/7) 5m({score_5m}/7) 1m({score_1m}/7) = ALL ALIGNED",
+                reason=f"LONG: 15m({score_15m}/7) 5m({score_5m}/7) 1m({score_1m}/7) + RSI>SMA all TF",
                 tf_15m=dir_15m, tf_5m=dir_5m, tf_1m=dir_1m,
                 indicators={"15m": ind_15m, "5m": ind_5m, "1m": ind_1m},
             )
@@ -230,13 +249,14 @@ class MultiTFScalpStrategy:
                 entry_price=price,
                 stop_loss=sl,
                 take_profit=tp,
-                reason=f"SHORT: 15m({score_15m}/7) 5m({score_5m}/7) 1m({score_1m}/7) = ALL ALIGNED",
+                reason=f"SHORT: 15m({score_15m}/7) 5m({score_5m}/7) 1m({score_1m}/7) + RSI<SMA all TF",
                 tf_15m=dir_15m, tf_5m=dir_5m, tf_1m=dir_1m,
                 indicators={"15m": ind_15m, "5m": ind_5m, "1m": ind_1m},
             )
 
         else:
-            reason = f"NO TRADE: 15m={dir_15m.value}({score_15m}) 5m={dir_5m.value}({score_5m}) 1m={dir_1m.value}({score_1m})"
+            rsi_info = f"RSI:{rsi_15m[0]}/{rsi_5m[0]}/{rsi_1m[0]}"
+            reason = f"NO TRADE: 15m={dir_15m.value}({score_15m}) 5m={dir_5m.value}({score_5m}) 1m={dir_1m.value}({score_1m}) | {rsi_info}"
             return MultiTFSignal(
                 direction=Direction.NEUTRAL,
                 strength=0,
