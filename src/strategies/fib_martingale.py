@@ -175,8 +175,8 @@ class FibMartingaleStrategy:
         for order in self.active_session.orders:
             if not order.filled and current_price <= order.price:
                 order.filled = True
-                order.fill_price = current_price
-                order.qty = order.amount_usdt / current_price
+                order.fill_price = order.price  # Fill at the Fib level price, not current
+                order.qty = order.amount_usdt / order.price
                 order.fill_time = datetime.now(timezone.utc).isoformat()
                 filled.append(order)
 
