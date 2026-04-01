@@ -25,6 +25,7 @@ from src.exchange.client import ExchangeClient
 from src.data.fetcher import DataFetcher
 from src.indicators.technical import add_all_indicators
 from src.strategies.scalp_multi_tf import MultiTFScalpStrategy, Direction
+from src.strategies.fib_martingale import FibMartingaleStrategy
 from src.utils.logger import setup_logger, console
 
 logger = logging.getLogger("trade4me")
@@ -54,6 +55,14 @@ STRATEGY_CONFIG = {
     "sl_pct": 0.3,           # 0.3% stop loss
     "tp_pct": 0.6,           # 0.6% take profit (2:1 R/R)
     "min_agree": 4,           # 4/7 indicators must agree
+}
+
+# Fib Martingale config
+FIB_CONFIG = {
+    "total_capital": 100.0,
+    "tp_fib": 0.0,
+    "sl_margin_pct": 0.5,
+    "min_candle_range_pct": 0.05,
 }
 
 
@@ -261,6 +270,7 @@ def run_scalper(live: bool = False):
     )
     fetcher = DataFetcher(client)
     strategy = MultiTFScalpStrategy(STRATEGY_CONFIG)
+    fib = FibMartingaleStrategy(FIB_CONFIG)
     trader = PaperTrader(PAPER_CAPITAL)
 
     mode = "live" if live else "paper"
@@ -306,6 +316,64 @@ def run_scalper(live: bool = False):
                             signal.take_profit,
                         )
 
+                # ── FIB MARTINGALE ─────────────────────────────
+                # Check for red 15m candle → create new session
+                if not fib.active_session:
+                    red_candle = fib.detect_red_candle(dfs["15m"])
+                    if red_candle:
+                        session = fib.create_session(red_candle["high"], red_candle["low"])
+                        console.print(
+                            f"\n  [bold magenta]FIB SESSION[/bold magenta] "
+                            f"Red candle: ${red_candle['high']:,.2f} → ${red_candle['low']:,.2f} "
+                            f"(range: {red_candle['range_pct']:.2f}%)"
+                        )
+                        for o in session.orders:
+                            console.print(
+                                f"    Fib {o.fib_level:.3f} → ${o.price:,.2f} → buy ${o.amount_usdt:.2f}",
+                                highlight=False,
+                            )
+                        console.print(
+                            f"    TP: [green]${session.take_profit:,.2f}[/green] | "
+                            f"SL: [red]${session.stop_loss:,.2f}[/red]\n"
+                        )
+
+                # Check fills on active session
+                if fib.active_session:
+                    fills = fib.check_fills(current_price)
+                    for f_order in fills:
+                        console.print(
+                            f"  [bold magenta]FIB FILL[/bold magenta] "
+                            f"Fib {f_order.fib_level:.3f} @ ${current_price:,.2f} "
+                            f"→ ${f_order.amount_usdt:.2f} | "
+                            f"Total: ${fib.active_session.total_invested:.2f} "
+                            f"avg: ${fib.active_session.avg_entry:,.2f}"
+                        )
+
+                    # Check TP/SL
+                    exit_info = fib.check_exit(current_price)
+                    if exit_info:
+                        pnl_style = "green" if exit_info["pnl"] >= 0 else "red"
+                        console.print(
+                            f"\n  [bold magenta]FIB {exit_info['reason']}[/bold magenta] "
+                            f"@ ${exit_info['exit_price']:,.2f} | "
+                            f"[{pnl_style}]P&L: ${exit_info['pnl']:+,.2f}[/{pnl_style}] | "
+                            f"Invested: ${exit_info['invested']:.2f} | "
+                            f"Fills: {exit_info['fills']}\n"
+                        )
+
+                    # Show Fib status every 10 scans
+                    if scan_count % 10 == 0:
+                        status = fib.get_status(current_price)
+                        if status["active"]:
+                            upnl = status["unrealized_pnl"]
+                            upnl_style = "green" if upnl >= 0 else "red"
+                            console.print(
+                                f"  [magenta]FIB: {status['fills']}/{status['total_orders']} fills | "
+                                f"Invested: ${status['invested']:.2f} | "
+                                f"Avg: ${status['avg_entry']:,.2f} | "
+                                f"uP&L: [{upnl_style}]${upnl:+,.2f}[/{upnl_style}][/magenta]"
+                            )
+
                 # Status every 10 scans
                 if scan_count % 10 == 0:
                     print_status(
@@ -314,6 +382,14 @@ def run_scalper(live: bool = False):
                         trader.stats,
                         mode,
                     )
+                    # Fib stats
+                    fib_stats = fib.stats
+                    if fib_stats["total_sessions"] > 0:
+                        console.print(
+                            f"  [magenta]FIB: Sessions:{fib_stats['total_sessions']} "
+                            f"W:{fib_stats['wins']} L:{fib_stats['losses']} "
+                            f"P&L: ${fib_stats['total_pnl']:+,.2f}[/magenta]\n"
+                        )
 
             except Exception as e:
                 logger.error(f"Scan error: {e}")
