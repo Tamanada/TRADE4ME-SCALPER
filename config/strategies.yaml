@@ -1,0 +1,35 @@
+# TRADE4ME-CEX — Strategy Configuration (OPTIMIZED)
+
+scalp_ema:
+  enabled: true
+  ema_fast: 9
+  ema_slow: 21
+  rsi_oversold: 30
+  rsi_overbought: 70
+  min_volume_ratio: 1.2      # was 1.5 — slightly relaxed
+
+scalp_rsi:
+  enabled: true
+  rsi_entry: 35              # was 25 — RSI<25 too rare, 35 catches more dips
+  rsi_exit: 65               # was 70 — catch overbought earlier
+  ema_trend: 50
+  min_volume_ratio: 0.8      # was 1.2 — volume not always reliable on all pairs
+  use_ema_filter: true        # can disable for more aggressive mode
+
+scalp_momentum:
+  enabled: true               # TOP performer from backtest
+  min_volume_ratio: 1.0
+  bb_proximity_pct: 2.0
+  require_bb: false
+
+arbitrage:
+  enabled: true
+  min_exchanges: 3
+  scan_top_n: 50
+
+grid:
+  enabled: false
+
+ml_predictor:
+  enabled: false
+  confidence_threshold: 0.65

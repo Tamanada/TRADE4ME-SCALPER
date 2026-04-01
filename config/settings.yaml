@@ -1,0 +1,71 @@
+# TRADE4ME-CEX — Configuration Generale
+
+exchange:
+  name: binance
+  sandbox: true
+
+trading:
+  mode: paper  # paper | live
+  symbols:
+    - BTC/USDT
+    - ETH/USDT
+    - SOL/USDT
+    - DOGE/USDT
+    - AVAX/USDT
+    - LINK/USDT
+    - ADA/USDT
+    - XRP/USDT
+  timeframe: 1h        # best performer from backtest
+  candle_limit: 100
+
+risk:
+  max_position_pct: 5.0       # was 2% — bigger positions for more impact
+  stop_loss_pct: 1.5           # was 1% — slightly more room to breathe
+  take_profit_pct: 3.0         # was 1.5% — let winners run (2:1 R/R ratio)
+  trailing_stop_pct: 0.8       # was 0.5% — tighter trail once in profit
+  max_drawdown_pct: 15.0       # was 10% — more room with bigger positions
+  max_open_positions: 5        # was 3 — trade more pairs simultaneously
+  max_daily_loss_pct: 7.0      # was 5% — proportional to bigger position size
+
+bot:
+  loop_interval_sec: 10
+  log_level: INFO
+  csv_logging: true
+  paper_capital: 10000.0
+
+# Multi-Exchange Arbitrage
+exchanges:
+  - name: binance
+    sandbox: true
+  - name: bybit
+    sandbox: true
+  - name: kucoin
+    sandbox: true
+
+arbitrage:
+  mode: paper
+  max_trade_usdt: 100
+  min_spread_pct: 0.3
+  max_slippage_pct: 0.5
+  auto_exec:
+    enabled: false
+    min_net_spread_pct: 1.0
+    cooldown_sec: 30
+    max_per_cycle: 3
+
+# Grid Trading
+grid:
+  enabled: false
+  symbol: BTC/USDT
+  upper_price: 70000
+  lower_price: 60000
+  grid_levels: 10
+  amount_per_grid: 20  # USDT per grid level
+
+# ML Prediction
+ml:
+  enabled: false
+  retrain_interval_hours: 24
+  min_training_samples: 100
+  confidence_threshold: 0.65
+  model_path: data/ml_model.pkl

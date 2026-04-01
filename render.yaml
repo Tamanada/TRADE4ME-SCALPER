@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: trade4me-scalper
+    runtime: python
+    buildCommand: pip install ccxt ta pandas numpy pyyaml python-dotenv rich
+    startCommand: python scalper.py
+    envVars:
+      - key: EXCHANGE_NAME
+        sync: false
+      - key: EXCHANGE_API_KEY
+        sync: false
+      - key: EXCHANGE_API_SECRET
+        sync: false

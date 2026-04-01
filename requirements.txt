@@ -1,0 +1,21 @@
+# Exchange connectivity
+ccxt>=4.4.0
+
+# Data handling
+pandas>=2.2.0
+numpy>=2.0.0
+
+# Technical indicators
+ta>=0.11.0
+
+# ML prediction
+xgboost>=2.1.0
+scikit-learn>=1.5.0
+joblib>=1.4.0
+
+# Configuration
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Terminal UI
+rich>=13.9.0
