@@ -243,6 +243,7 @@ def run_scalper(live: bool = False):
         exchange_name=exchange_name,
         api_key=os.getenv("EXCHANGE_API_KEY"),
         api_secret=os.getenv("EXCHANGE_API_SECRET"),
+        password=os.getenv("EXCHANGE_PASSWORD"),  # KuCoin passphrase
         sandbox=not live,
     )
     fetcher = DataFetcher(client)
