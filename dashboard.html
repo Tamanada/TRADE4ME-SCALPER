@@ -17816,7 +17816,7 @@ function _v2Compute(candles) {
   const buySignalDiv  = wtBullDiv.map((v, i) => v);
   const sellSignalDiv = wtBearDiv.map((v, i) => v);
   return { wt1, wt2, wtVwap, rsiMFI, rsi, stochK, stochD,
-           wtCross, crossColor, buySignal, sellSignal,
+           wtCross, wtCrossUp, wtCrossDown, crossColor, buySignal, sellSignal,
            wtBearDiv, wtBullDiv, wtGoldBuy,
            buySignalDiv, sellSignalDiv, candles, high, low };
 }
@@ -18030,6 +18030,7 @@ function _vmc2InitChart() {
   const H = wrap.clientHeight || 320;
   if (_vmc2LwcChart) {
     try { _vmc2LwcChart.applyOptions({ width: W, height: H }); } catch(e) {}
+    _vmc2DrawTradeOverlay();
     return;
   }
   _vmc2LwcChart = LightweightCharts.createChart(inner, {
@@ -18064,6 +18065,8 @@ function _vmc2InitChart() {
   _vmc2LwcChart.priceScale('vol').applyOptions({
     scaleMargins: { top: 0.82, bottom: 0 },
   });
+  // ── Price scale vertical pan → redraw trade overlay ──
+  _vmc2LwcChart.subscribeCrosshairMove(() => { if (_vmc2TInTrade) _vmc2DrawTradeOverlay(); });
   // ── Pan / zoom sync: mirror LWC logical range directly onto canvas ──
   _vmc2LwcChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
     if (!range || !_vmc2Data) return;
@@ -18074,7 +18077,12 @@ function _vmc2InitChart() {
     canvas.height = wrap.clientHeight || 300;
     // Pass raw from/to — same mapping LWC uses, including empty right slots
     _v2Draw(canvas, _vmc2Data, range.from, range.to, _vmc2RightPad());
+    _vmc2DrawTradeOverlay(); // keep SL/TP lines aligned on pan/zoom
   });
+  // Attach drag listeners for SL/TP lines (once)
+  setTimeout(_vmc2AttachDragListeners, 300);
+  // Trade overlay canvas — always on top of LWC chart
+  setTimeout(_vmc2CreateTradeOverlay, 150);
 }
 
 // Shared bar count — both charts show exactly this many bars
@@ -18245,6 +18253,7 @@ async function _vmc2StartTickMode(coin, bucketMs) {
     _vmc2Data = _v2Compute(bars);
     _vmc2Render();
     _vmc2TAutoCheck();
+    if (!_vmc2TInTrade) _vmc2TRefreshTpPreview(); // live preview when flat
     _vmc2Status(`⚡ ${coin} ${label} · ${bars.length}b · ${new Date().toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`, 'var(--green)');
   }, Math.max(1000, bucketMs));
 }
@@ -18296,6 +18305,7 @@ function _vmc2Render() {
   const n  = _vmc2Data.wt1.length;
   // Match exactly what _vmc2FeedChart passes to setVisibleLogicalRange
   _v2Draw(canvas, _vmc2Data, n - bv - 1, n + 2, _vmc2RightPad());
+  _vmc2DrawTradeOverlay(); // keep SL/TP trade lines current
 }
 
 function _vmc2UpdateSignalBar() {
@@ -18358,27 +18368,256 @@ let _vmc2TPnl        = 0;
 let _vmc2TWins       = 0;
 let _vmc2TLosses     = 0;
 let _vmc2TPriceLines = [];
+let _vmc2SlPriceLine = null;   // draggable SL line ref
+let _vmc2TpPriceLine = null;   // draggable TP line ref
 let _vmc2TMarkers    = [];
 let _vmc2TPnlTimer   = null;
+
+function _vmc2TRefreshTpPreview() {
+  // Prix actuel = dernière bougie tick ou barre VMC2
+  let price = 0;
+  if (_vmc2TickCur)                      price = _vmc2TickCur.c;
+  else if (_vmc2TickBars.length)         price = _vmc2TickBars[_vmc2TickBars.length - 1].c;
+  else if (_vmc2Data?.close?.length)     price = _vmc2Data.close[_vmc2Data.close.length - 1];
+  if (!price) return;
+
+  const slPct = parseFloat(document.getElementById('vmc2T-sl')?.value) || 1.5;
+  const tpPct = parseFloat(document.getElementById('vmc2T-tp')?.value) || 3;
+
+  // Affiche LONG/SHORT dans les deux sens (▲ LONG TP, ▼ SHORT TP)
+  const slL = fmtPrice(price * (1 - slPct / 100));
+  const slS = fmtPrice(price * (1 + slPct / 100));
+  const tpL = fmtPrice(price * (1 + tpPct / 100));
+  const tpS = fmtPrice(price * (1 - tpPct / 100));
+
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+  set('vmc2T-slPreviewL', slL);
+  set('vmc2T-slPreviewS', slS);
+  set('vmc2T-tpPreviewL', tpL);
+  set('vmc2T-tpPreviewS', tpS);
+}
 
 function _vmc2TSetStatus(msg, col = 'var(--muted2)') {
   const el = document.getElementById('vmc2T-status');
   if (el) { el.textContent = msg; el.style.color = col; }
 }
 
+// ── Mode MANUEL / AUTO VMC ────────────────────────────────────────────────
+function _vmc2TSetMode(mode) {
+  _vmc2TAutoOn = (mode === 'auto');
+  const mBtn    = document.getElementById('vmc2T-modeManuel');
+  const aBtn    = document.getElementById('vmc2T-modeAuto');
+  const longBtn = document.getElementById('vmc2T-longBtn');
+  const shortBtn= document.getElementById('vmc2T-shortBtn');
+  const preview = document.getElementById('vmc2T-previewRow');
+  const autoSet = document.getElementById('vmc2T-autoSettings');
+
+  if (mode === 'auto') {
+    if (mBtn)    { mBtn.style.background = 'transparent';           mBtn.style.color = 'var(--muted2)'; }
+    if (aBtn)    { aBtn.style.background = 'rgba(180,124,255,.22)'; aBtn.style.color = '#b47cff'; }
+    if (longBtn)  longBtn.style.display  = 'none';
+    if (shortBtn) shortBtn.style.display = 'none';
+    if (preview)  preview.style.display  = 'none';
+    if (autoSet)  autoSet.style.display  = 'flex';
+    _vmc2TLastSigBar = -1;
+    _vmc2TSetStatus('🤖 AUTO VMC actif — surveille les signaux Pine Script', '#b47cff');
+  } else {
+    if (mBtn)    { mBtn.style.background = 'rgba(100,210,255,.15)'; mBtn.style.color = 'var(--accent)'; }
+    if (aBtn)    { aBtn.style.background = 'transparent';           aBtn.style.color = 'var(--muted2)'; }
+    if (longBtn)  longBtn.style.display  = '';
+    if (shortBtn) shortBtn.style.display = '';
+    if (preview)  preview.style.display  = 'flex';
+    if (autoSet)  autoSet.style.display  = 'none';
+    _vmc2TSetStatus('✋ Manuel — clique ▲ LONG ou ▼ SHORT', 'var(--muted2)');
+  }
+}
+
 function _vmc2TClearSignals() {
   _vmc2TPriceLines.forEach(l => { try { _vmc2CandleSer.removePriceLine(l); } catch(e){} });
   _vmc2TPriceLines = [];
+  _vmc2SlPriceLine = null;
+  _vmc2TpPriceLine = null;
   if (_vmc2CandleSer) { try { _vmc2CandleSer.setMarkers([]); } catch(e){} }
   _vmc2TMarkers = [];
+  _vmc2DrawTradeOverlay(); // clear canvas overlay (draws nothing when !_vmc2TInTrade)
+}
+
+// ── Trade Overlay Canvas — SL / TP / ENTRY always visible ─────────────────
+function _vmc2CreateTradeOverlay() {
+  const wrap = document.getElementById('vmc2ChartWrap');
+  if (!wrap || document.getElementById('vmc2TradeOverlay')) return;
+  const cv = document.createElement('canvas');
+  cv.id = 'vmc2TradeOverlay';
+  cv.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10';
+  wrap.appendChild(cv);
+}
+
+let _vmc2OverlayRaf = null;
+function _vmc2DrawTradeOverlay() {
+  if (_vmc2OverlayRaf) return;
+  _vmc2OverlayRaf = requestAnimationFrame(() => { _vmc2OverlayRaf = null; _vmc2_doDrawOverlay(); });
+}
+
+function _vmc2_doDrawOverlay() {
+  const cv = document.getElementById('vmc2TradeOverlay');
+  if (!cv || !_vmc2CandleSer) return;
+  const W = cv.offsetWidth;
+  const H = cv.offsetHeight;
+  if (!W || !H) return;
+  cv.width  = W;
+  cv.height = H;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+  if (!_vmc2TInTrade) return;
+
+  const rp    = (_vmc2RightPad() || 65) + 2; // stop before price-axis
+  const lineW = W - rp;
+
+  const lines = [
+    { price: _vmc2TEntry, color: '#64d2ff', dash: [4,4], lw: 1, tag: `ENTRY ${fmtPrice(_vmc2TEntry)}` },
+    { price: _vmc2TSl,    color: '#ff2d55', dash: [6,3], lw: 2, tag: `SL ${fmtPrice(_vmc2TSl)}` },
+  ];
+  if (_vmc2TTp > 0)
+    lines.push({ price: _vmc2TTp, color: '#00e676', dash: [6,3], lw: 2, tag: `TP ${fmtPrice(_vmc2TTp)}` });
+
+  for (const ln of lines) {
+    const rawY   = _vmc2CandleSer.priceToCoordinate(ln.price);
+    const inView = rawY !== null && rawY >= 1 && rawY <= H - 1;
+    // Off-screen direction: if rawY is null, compare price with entry as reference
+    const isAbove = rawY !== null ? rawY < 1 : ln.price > _vmc2TEntry;
+
+    ctx.save();
+    ctx.strokeStyle = ln.color;
+    ctx.fillStyle   = ln.color;
+    ctx.lineWidth   = ln.lw;
+    ctx.font        = 'bold 11px "IBM Plex Mono",monospace';
+
+    if (inView) {
+      // ── Dashed line across chart body ──
+      ctx.setLineDash(ln.dash);
+      ctx.beginPath();
+      ctx.moveTo(0, rawY);
+      ctx.lineTo(lineW, rawY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // ── Pill label at left edge ──
+      ctx.textBaseline = 'middle';
+      ctx.textAlign    = 'left';
+      const tw = ctx.measureText(ln.tag).width;
+      ctx.globalAlpha = 0.80;
+      ctx.fillStyle   = '#050a14';
+      ctx.fillRect(3, rawY - 9, tw + 12, 18);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle   = ln.color;
+      ctx.fillText(ln.tag, 8, rawY);
+    } else {
+      // ── Off-screen: arrow badge at top or bottom ──
+      const A  = 7;
+      const BY = isAbove ? 16 : H - 16;
+      const BX = Math.max(70, lineW - 155);
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 0.88;
+      ctx.beginPath();
+      if (isAbove) {
+        ctx.moveTo(BX,     BY - A);
+        ctx.lineTo(BX - A, BY + 1);
+        ctx.lineTo(BX + A, BY + 1);
+      } else {
+        ctx.moveTo(BX,     BY + A);
+        ctx.lineTo(BX - A, BY - 1);
+        ctx.lineTo(BX + A, BY - 1);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalAlpha  = 1;
+      ctx.textBaseline = 'middle';
+      ctx.textAlign    = 'left';
+      ctx.fillText(ln.tag, BX + A + 6, BY);
+    }
+    ctx.restore();
+  }
 }
 
 function _vmc2TDrawSignals(dir, entry, sl, tp) {
   _vmc2TClearSignals();
   if (!_vmc2CandleSer) return;
-  _vmc2TPriceLines.push(_vmc2CandleSer.createPriceLine({ price: entry, color: '#64d2ff',   lineWidth: 1, lineStyle: 2, title: '▶ ENTRY', axisLabelVisible: true }));
-  _vmc2TPriceLines.push(_vmc2CandleSer.createPriceLine({ price: sl,    color: '#ff2d55',   lineWidth: 1, lineStyle: 2, title: '✕ SL',    axisLabelVisible: true }));
-  _vmc2TPriceLines.push(_vmc2CandleSer.createPriceLine({ price: tp,    color: '#00e676',   lineWidth: 1, lineStyle: 2, title: '★ TP',    axisLabelVisible: true }));
+  // Canvas overlay handles all line drawing (works even when price is off-screen)
+  _vmc2DrawTradeOverlay();
+}
+
+// ── Coordinate → Price (LWC native, works at any Y on the price scale) ─────
+function _vmc2CoordToPrice(y) {
+  if (!_vmc2CandleSer || !_vmc2TInTrade) return null;
+  // coordinateToPrice() is available in LWC v4 — always accurate, no interpolation needed
+  return _vmc2CandleSer.coordinateToPrice(y) ?? null;
+}
+
+// ── Drag SL / TP price lines ──────────────────────────────────────────────
+function _vmc2AttachDragListeners() {
+  const wrap = document.getElementById('vmc2ChartWrap');
+  if (!wrap || wrap._vmc2DragAttached) return;
+  wrap._vmc2DragAttached = true;
+
+  const THRESH = 8; // px proximity to grab a line
+  let _drag = null; // 'sl' | 'tp' | null
+
+  const getRelY = (e) => e.clientY - wrap.getBoundingClientRect().top;
+
+  // Capture mousedown — intercept before LWC if near a line
+  wrap.addEventListener('mousedown', e => {
+    if (!_vmc2TInTrade || !_vmc2CandleSer) return;
+    const y   = getRelY(e);
+    const slY = _vmc2CandleSer.priceToCoordinate(_vmc2TSl);
+    const tpY = _vmc2TTp > 0 ? _vmc2CandleSer.priceToCoordinate(_vmc2TTp) : null;
+    if      (slY !== null && Math.abs(y - slY) <= THRESH) _drag = 'sl';
+    else if (tpY !== null && Math.abs(y - tpY) <= THRESH) _drag = 'tp';
+    if (_drag) {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      wrap.style.cursor = 'ns-resize';
+      _vmc2LwcChart?.applyOptions({ handleScroll: false, handleScale: false });
+    }
+  }, true);
+
+  // Drag on document so it works even if mouse leaves the chart
+  document.addEventListener('mousemove', e => {
+    if (!_drag) return;
+    const y   = getRelY(e);
+    const p   = _vmc2CoordToPrice(y);
+    if (!p || p <= 0) return;
+    if (_drag === 'sl') {
+      _vmc2TSl = p;
+      const el = document.getElementById('vmc2T-posSl');
+      if (el) el.textContent = fmtPrice(p);
+      const inp = document.getElementById('vmc2T-sl');
+      if (inp) inp.value = Math.abs((p - _vmc2TEntry) / _vmc2TEntry * 100).toFixed(2);
+    } else {
+      _vmc2TTp = p;
+      const el = document.getElementById('vmc2T-posTp');
+      if (el) el.textContent = fmtPrice(p);
+      const inp = document.getElementById('vmc2T-tp');
+      if (inp) inp.value = Math.abs((p - _vmc2TEntry) / _vmc2TEntry * 100).toFixed(2);
+    }
+    _vmc2DrawTradeOverlay(); // live-update canvas line during drag
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (!_drag) return;
+    _drag = null;
+    wrap.style.cursor = '';
+    _vmc2LwcChart?.applyOptions({ handleScroll: true, handleScale: true });
+  });
+
+  // Hover cursor: show ns-resize when near SL or TP
+  wrap.addEventListener('mousemove', e => {
+    if (_drag || !_vmc2TInTrade || !_vmc2CandleSer) return;
+    const y   = getRelY(e);
+    const slY = _vmc2CandleSer.priceToCoordinate(_vmc2TSl);
+    const tpY = _vmc2TTp > 0 ? _vmc2CandleSer.priceToCoordinate(_vmc2TTp) : null;
+    const near = (slY !== null && Math.abs(y - slY) <= THRESH) ||
+                 (tpY !== null && Math.abs(y - tpY) <= THRESH);
+    wrap.style.cursor = near ? 'ns-resize' : '';
+  });
 }
 
 function _vmc2TUpdatePos(currentPrice) {
@@ -18392,7 +18631,13 @@ function _vmc2TUpdatePos(currentPrice) {
   _vmc2TPnl = pnl;
   const pnlEl = document.getElementById('vmc2T-posPnl');
   if (pnlEl) { pnlEl.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`; pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)'; }
-  // Only SL check — NO fixed TP, exit is signal-driven
+  // TP check
+  const tpHit = (_vmc2TTp > 0) && (
+    (_vmc2TDir === 'LONG'  && currentPrice >= _vmc2TTp) ||
+    (_vmc2TDir === 'SHORT' && currentPrice <= _vmc2TTp)
+  );
+  if (tpHit) { _vmc2TClose('TP ★'); return; }
+  // SL check
   const slHit = (_vmc2TDir === 'LONG' && currentPrice <= _vmc2TSl) ||
                 (_vmc2TDir === 'SHORT' && currentPrice >= _vmc2TSl);
   if (slHit) _vmc2TClose('SL ✕');
@@ -18405,33 +18650,30 @@ async function _vmc2TTrade(dir) {
   const size  = parseFloat(document.getElementById('vmc2T-size')?.value) || 100;
   const lev   = parseFloat(document.getElementById('vmc2T-lev')?.value)  || 2;
   const slPct = parseFloat(document.getElementById('vmc2T-sl')?.value)   || 1.5;
+  const tpPct = parseFloat(document.getElementById('vmc2T-tp')?.value)   || 3;
   _vmc2TSetStatus('Fetching price…', 'var(--accent)');
   try {
     const entry = await hlPrice(coin);
-    // SL only — no fixed TP, exit driven by next opposite signal
     const sl = dir === 'LONG' ? entry * (1 - slPct/100) : entry * (1 + slPct/100);
+    const tp = dir === 'LONG' ? entry * (1 + tpPct/100) : entry * (1 - tpPct/100);
     _vmc2TInTrade = true;
     _vmc2TDir     = dir;
     _vmc2TEntry   = entry;
     _vmc2TSl      = sl;
-    _vmc2TTp      = 0; // no fixed TP
+    _vmc2TTp      = tp;
     if (!paper) await hlMarketOrder(coin, dir === 'LONG', size / entry, lev);
-    // UI
+    // UI — position display
     document.getElementById('vmc2T-pos').style.display    = 'flex';
     document.getElementById('vmc2T-longBtn').disabled     = true;
     document.getElementById('vmc2T-shortBtn').disabled    = true;
     const dirEl = document.getElementById('vmc2T-posDir');
     if (dirEl) { dirEl.textContent = dir; dirEl.style.color = dir === 'LONG' ? 'var(--green)' : 'var(--red)'; }
-    document.getElementById('vmc2T-posEntry').textContent = entry.toFixed(4);
-    document.getElementById('vmc2T-posSl').textContent    = sl.toFixed(4);
-    document.getElementById('vmc2T-posTp').textContent    = '↺ signal';
-    // Draw entry + SL lines only (no TP line)
-    _vmc2TClearSignals();
-    if (_vmc2CandleSer) {
-      _vmc2TPriceLines.push(_vmc2CandleSer.createPriceLine({ price: entry, color: '#64d2ff', lineWidth: 1, lineStyle: 2, title: dir === 'LONG' ? '▲ LONG' : '▼ SHORT', axisLabelVisible: true }));
-      _vmc2TPriceLines.push(_vmc2CandleSer.createPriceLine({ price: sl,    color: '#ff2d55', lineWidth: 1, lineStyle: 2, title: '✕ SL', axisLabelVisible: true }));
-    }
-    _vmc2TSetStatus(`${paper?'📋':'🔴'} ${dir} @ ${entry.toFixed(4)} | SL ${sl.toFixed(4)} | exit: signal`, dir === 'LONG' ? 'var(--green)' : 'var(--red)');
+    document.getElementById('vmc2T-posEntry').textContent = fmtPrice(entry);
+    document.getElementById('vmc2T-posSl').textContent    = fmtPrice(sl);
+    document.getElementById('vmc2T-posTp').textContent    = fmtPrice(tp);
+    // Lignes pointillées : ENTRY (cyan) + SL (rouge) + TP (vert)
+    _vmc2TDrawSignals(dir, entry, sl, tp);
+    _vmc2TSetStatus(`${paper?'📋':'🔴'} ${dir} @ ${fmtPrice(entry)} | SL ${fmtPrice(sl)} | TP ${fmtPrice(tp)}`, dir === 'LONG' ? 'var(--green)' : 'var(--red)');
     // Poll P&L every 2s
     _vmc2TPnlTimer = setInterval(async () => {
       try { const p = await hlPrice(coin); _vmc2TUpdatePos(p); } catch(e) {}
@@ -18469,23 +18711,9 @@ let _vmc2TAutoOn       = false;
 let _vmc2TAutoLock     = false;  // prevent concurrent entries
 let _vmc2TLastSigBar   = -1;     // bar index of last acted signal
 
+// Legacy alias — kept in case other code calls it
 function _vmc2TToggleAuto() {
-  _vmc2TAutoOn = !_vmc2TAutoOn;
-  const btn = document.getElementById('vmc2T-autoBtn');
-  if (_vmc2TAutoOn) {
-    btn.textContent = '🤖 AUTO: ON';
-    btn.style.borderColor  = 'rgba(180,124,255,.7)';
-    btn.style.background   = 'rgba(180,124,255,.15)';
-    btn.style.color        = '#b47cff';
-    _vmc2TSetStatus('🤖 Auto actif — surveille les signaux VMC', '#b47cff');
-    _vmc2TLastSigBar = -1; // reset so next signal is acted on
-  } else {
-    btn.textContent = '🤖 AUTO: OFF';
-    btn.style.borderColor  = 'rgba(100,210,255,.25)';
-    btn.style.background   = 'rgba(100,210,255,.05)';
-    btn.style.color        = 'var(--muted2)';
-    _vmc2TSetStatus('🤖 Auto désactivé', 'var(--muted2)');
-  }
+  _vmc2TSetMode(_vmc2TAutoOn ? 'manuel' : 'auto');
 }
 
 // Called after every VMC recompute — checks last COMPLETED bar (N-2) for signals
@@ -18494,30 +18722,56 @@ async function _vmc2TAutoCheck() {
   const d = _vmc2Data;
   const N = d.buySignal.length;
   if (N < 3) return;
-  // Use bar N-2 (last fully closed bar) to avoid acting on in-progress bar
-  const si = N - 2;
-  if (si <= _vmc2TLastSigBar) return; // already acted on this bar
+  const si = N - 2; // dernière bougie fermée
+  if (si <= _vmc2TLastSigBar) return;
 
-  const isBuy  = d.buySignal[si] || d.wtGoldBuy[si];
-  const isSell = d.sellSignal[si];
+  // ── Lire les checkboxes Pine Script ──
+  const chk = id => document.getElementById(id)?.checked !== false;
+  const useBuyMain  = chk('vmc2T-as-buyMain');   // 🟢 BUY circle
+  const useBuyGold  = chk('vmc2T-as-buyGold');   // 🟡 GOLD
+  const useBuyDiv   = document.getElementById('vmc2T-as-buyDiv')?.checked;   // 📈 Div+
+  const useBuyDot   = document.getElementById('vmc2T-as-buyDot')?.checked;   // · any cross↑
+  const useSellMain = chk('vmc2T-as-sellMain');  // 🔴 SELL circle
+  const useSellDiv  = document.getElementById('vmc2T-as-sellDiv')?.checked;  // 📉 Div-
+  const useSellDot  = document.getElementById('vmc2T-as-sellDot')?.checked;  // · any cross↓
+  const useExitSig  = chk('vmc2T-as-exitSig');   // exit on opposite signal
+
+  // ── Calcul des signaux selon Pine Script VMC Cipher B ──
+  const isBuy  = (useBuyMain  && d.buySignal[si])                          // wtCross && wtCrossUp && wtOversold
+              || (useBuyGold  && d.wtGoldBuy[si])                          // gold divergence
+              || (useBuyDiv   && d.buySignalDiv[si])                       // WT/RSI/Stoch bull div
+              || (useBuyDot   && d.wtCross[si] && d.wtCrossUp[si]);        // any WT cross up
+
+  const isSell = (useSellMain && d.sellSignal[si])                         // wtCross && wtCrossDown && wtOverbought
+              || (useSellDiv  && d.sellSignalDiv[si])                      // WT/RSI/Stoch bear div
+              || (useSellDot  && d.wtCross[si] && d.wtCrossDown[si]);      // any WT cross down
+
+  // ── Exit sur signal opposé si en trade ──
+  if (_vmc2TInTrade && useExitSig) {
+    if (_vmc2TDir === 'LONG'  && isSell) { _vmc2TLastSigBar = si; await _vmc2TClose('↺ Signal SELL'); return; }
+    if (_vmc2TDir === 'SHORT' && isBuy)  { _vmc2TLastSigBar = si; await _vmc2TClose('↺ Signal BUY');  return; }
+  }
+
   if (!isBuy && !isSell) return;
-
   const sigDir = isBuy ? 'LONG' : 'SHORT';
-
-  // Same direction already in trade → skip
   if (_vmc2TInTrade && _vmc2TDir === sigDir) { _vmc2TLastSigBar = si; return; }
+
+  // ── Label du signal pour le log ──
+  const sigLabel = isBuy
+    ? (d.wtGoldBuy[si] ? '🟡 GOLD' : d.buySignalDiv[si] ? '📈 Div+' : d.wtCross[si] && !d.buySignal[si] ? '· cross↑' : '🟢 BUY')
+    : (d.sellSignalDiv[si] ? '📉 Div-' : d.wtCross[si] && !d.sellSignal[si] ? '· cross↓' : '🔴 SELL');
 
   _vmc2TAutoLock = true;
   _vmc2TLastSigBar = si;
   try {
-    // Close current trade if opposite
     if (_vmc2TInTrade && _vmc2TDir !== sigDir) {
-      await _vmc2TClose('↺ Inversion signal');
-      await new Promise(r => setTimeout(r, 300)); // small pause between close & open
+      await _vmc2TClose('↺ Signal opposé');
+      await new Promise(r => setTimeout(r, 300));
     }
-    // Flash signal on button
+    _vmc2TSetStatus(`⚡ AUTO — ${sigLabel} → ${sigDir}`, sigDir === 'LONG' ? '#00e676' : '#ff2d55');
+    // Flash effect
     const btn = document.getElementById(sigDir === 'LONG' ? 'vmc2T-longBtn' : 'vmc2T-shortBtn');
-    if (btn) { btn.style.boxShadow = '0 0 12px 3px ' + (sigDir === 'LONG' ? '#00e676' : '#ff2d55'); setTimeout(() => { if(btn) btn.style.boxShadow=''; }, 800); }
+    if (btn) { btn.style.boxShadow = '0 0 14px 4px ' + (sigDir === 'LONG' ? '#00e676' : '#ff2d55'); setTimeout(() => { if(btn) btn.style.boxShadow=''; }, 900); }
     await _vmc2TTrade(sigDir);
   } finally {
     _vmc2TAutoLock = false;
@@ -19087,61 +19341,129 @@ function _tdsExportCSV() {
     <span id="vmc2-status" style="font-size:9px;color:var(--muted2);margin-left:12px;flex-shrink:0"></span>
   </div>
 
-  <!-- ── Trade Bar ── -->
-  <div style="display:flex;align-items:center;gap:8px;padding:5px 14px;flex-shrink:0;flex-wrap:wrap;
-    background:rgba(5,15,26,.78);border-bottom:1px solid rgba(100,210,255,.1)">
-    <!-- Paper / Live -->
-    <label style="display:flex;align-items:center;gap:4px;font-size:10px;cursor:pointer;user-select:none;flex-shrink:0">
-      <input type="checkbox" id="vmc2T-paper" checked style="width:12px;height:12px;accent-color:#b47cff"
-        onchange="(function(v){const l=document.getElementById('vmc2T-modeLabel');if(l){l.textContent=v?'📋 PAPER':'🔴 RÉEL';l.style.color=v?'#b47cff':'#ff2d55';}})(this.checked)"/>
-      <span id="vmc2T-modeLabel" style="color:#b47cff;font-weight:700;letter-spacing:.05em;font-size:10px">📋 PAPER</span>
-    </label>
-    <div style="width:1px;height:14px;background:rgba(100,210,255,.2)"></div>
-    <label style="font-size:10px;color:var(--muted2);display:flex;align-items:center;gap:3px;flex-shrink:0">$
-      <input id="vmc2T-size" type="number" value="100" min="10" step="10"
-        style="width:60px;background:var(--bg2);color:var(--text);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:'IBM Plex Mono',monospace;font-size:10px;outline:none"/>
-    </label>
-    <label style="font-size:10px;color:var(--muted2);display:flex;align-items:center;gap:3px;flex-shrink:0">Lev×
-      <input id="vmc2T-lev" type="number" value="2" min="1" max="50"
-        style="width:38px;background:var(--bg2);color:var(--text);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:'IBM Plex Mono',monospace;font-size:10px;outline:none"/>
-    </label>
-    <label style="font-size:10px;color:var(--muted2);display:flex;align-items:center;gap:3px;flex-shrink:0">SL%
-      <input id="vmc2T-sl" type="number" value="1.5" min="0.1" max="10" step="0.1"
-        style="width:42px;background:var(--bg2);color:var(--text);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:'IBM Plex Mono',monospace;font-size:10px;outline:none"/>
-    </label>
-    <div style="width:1px;height:14px;background:rgba(100,210,255,.2)"></div>
-    <!-- LONG / SHORT / AUTO buttons -->
-    <button id="vmc2T-longBtn" onclick="_vmc2TTrade('LONG')"
-      style="font-size:11px;font-weight:800;padding:4px 14px;border-radius:3px;
-      border:1px solid rgba(0,230,118,.6);background:rgba(0,230,118,.15);color:#00e676;
-      cursor:pointer;font-family:'IBM Plex Mono',monospace;letter-spacing:.06em;flex-shrink:0">▲ LONG</button>
-    <button id="vmc2T-shortBtn" onclick="_vmc2TTrade('SHORT')"
-      style="font-size:11px;font-weight:800;padding:4px 14px;border-radius:3px;
-      border:1px solid rgba(255,45,85,.6);background:rgba(255,45,85,.15);color:#ff2d55;
-      cursor:pointer;font-family:'IBM Plex Mono',monospace;letter-spacing:.06em;flex-shrink:0">▼ SHORT</button>
-    <div style="width:1px;height:16px;background:rgba(100,210,255,.2);flex-shrink:0"></div>
-    <button id="vmc2T-autoBtn" onclick="_vmc2TToggleAuto()"
-      style="font-size:11px;font-weight:800;padding:4px 16px;border-radius:3px;
-      border:1px solid rgba(100,210,255,.25);background:rgba(100,210,255,.05);
-      color:var(--muted2);cursor:pointer;font-family:'IBM Plex Mono',monospace;
-      letter-spacing:.06em;flex-shrink:0;transition:all .2s">🤖 AUTO: OFF</button>
-    <!-- Position display (hidden when flat) -->
-    <div id="vmc2T-pos" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">
-      <div style="width:1px;height:14px;background:rgba(100,210,255,.2)"></div>
-      <span id="vmc2T-posDir"  style="font-size:11px;font-weight:800;letter-spacing:.06em">—</span>
-      <span style="font-size:10px;color:var(--muted2)">@</span>
-      <span id="vmc2T-posEntry" style="font-size:10px;color:var(--text)">—</span>
-      <span style="font-size:10px;color:var(--muted2)">SL</span>
-      <span id="vmc2T-posSl"    style="font-size:10px;color:var(--red)">—</span>
-      <span style="font-size:10px;color:var(--muted2)">Exit</span>
-      <span id="vmc2T-posTp"    style="font-size:10px;color:#b47cff">↺ signal</span>
-      <span style="font-size:10px;color:var(--muted2)">P&L</span>
-      <span id="vmc2T-posPnl"   style="font-size:11px;font-weight:700">$0.00</span>
-      <button onclick="_vmc2TClose()"
-        style="font-size:10px;padding:2px 10px;border-radius:3px;border:1px solid rgba(255,45,85,.4);
-        background:rgba(255,45,85,.08);color:var(--red);cursor:pointer;font-family:'IBM Plex Mono',monospace;font-weight:700">✕ CLOSE</button>
+  <!-- ── Trade Bar — 2 rows ── -->
+  <div style="background:rgba(5,15,26,.82);border-bottom:1px solid rgba(100,210,255,.12);flex-shrink:0;font-family:'IBM Plex Mono',monospace">
+
+    <!-- ROW 1 — Contrôles -->
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 16px;flex-wrap:wrap">
+
+      <!-- PAPER / RÉEL -->
+      <label style="display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none;flex-shrink:0">
+        <input type="checkbox" id="vmc2T-paper" checked style="width:14px;height:14px;accent-color:#b47cff"
+          onchange="(function(v){const l=document.getElementById('vmc2T-modeLabel');if(l){l.textContent=v?'📋 PAPER':'🔴 RÉEL';l.style.color=v?'#b47cff':'#ff2d55';}})(this.checked)"/>
+        <span id="vmc2T-modeLabel" style="color:#b47cff;font-weight:700;letter-spacing:.06em;font-size:13px">📋 PAPER</span>
+      </label>
+
+      <div style="width:1px;height:18px;background:rgba(100,210,255,.2);flex-shrink:0"></div>
+
+      <label style="font-size:12px;color:var(--muted2);display:flex;align-items:center;gap:4px;flex-shrink:0">$
+        <input id="vmc2T-size" type="number" value="100" min="10" step="10"
+          style="width:68px;background:var(--bg2);color:var(--text);border:1px solid var(--border2);border-radius:3px;padding:3px 6px;font-family:'IBM Plex Mono',monospace;font-size:12px;outline:none"/>
+      </label>
+
+      <label style="font-size:12px;color:var(--muted2);display:flex;align-items:center;gap:4px;flex-shrink:0">Lev×
+        <input id="vmc2T-lev" type="number" value="2" min="1" max="50"
+          style="width:44px;background:var(--bg2);color:var(--text);border:1px solid var(--border2);border-radius:3px;padding:3px 6px;font-family:'IBM Plex Mono',monospace;font-size:12px;outline:none"/>
+      </label>
+
+      <label style="font-size:12px;color:#ff6b6b;display:flex;align-items:center;gap:4px;flex-shrink:0;font-weight:700">SL%
+        <input id="vmc2T-sl" type="number" value="1.5" min="0.1" max="10" step="0.1"
+          style="width:50px;background:var(--bg2);color:var(--text);border:1px solid rgba(255,45,85,.4);border-radius:3px;padding:3px 6px;font-family:'IBM Plex Mono',monospace;font-size:12px;outline:none"
+          oninput="_vmc2TRefreshTpPreview()"/>
+      </label>
+
+      <label style="font-size:12px;color:#00e676;display:flex;align-items:center;gap:4px;flex-shrink:0;font-weight:700">TP%
+        <input id="vmc2T-tp" type="number" value="3" min="0.1" max="50" step="0.1"
+          style="width:50px;background:var(--bg2);color:var(--text);border:1px solid rgba(0,230,118,.4);border-radius:3px;padding:3px 6px;font-family:'IBM Plex Mono',monospace;font-size:12px;outline:none"
+          oninput="_vmc2TRefreshTpPreview()"/>
+      </label>
+
+      <div style="width:1px;height:18px;background:rgba(100,210,255,.2);flex-shrink:0"></div>
+
+      <button id="vmc2T-longBtn" onclick="_vmc2TTrade('LONG')"
+        style="font-size:13px;font-weight:800;padding:6px 20px;border-radius:4px;
+        border:1px solid rgba(0,230,118,.7);background:rgba(0,230,118,.15);color:#00e676;
+        cursor:pointer;font-family:'IBM Plex Mono',monospace;letter-spacing:.06em;flex-shrink:0;transition:all .15s"
+        onmouseover="this.style.background='rgba(0,230,118,.28)'" onmouseout="this.style.background='rgba(0,230,118,.15)'">▲ LONG</button>
+
+      <button id="vmc2T-shortBtn" onclick="_vmc2TTrade('SHORT')"
+        style="font-size:13px;font-weight:800;padding:6px 20px;border-radius:4px;
+        border:1px solid rgba(255,45,85,.7);background:rgba(255,45,85,.15);color:#ff2d55;
+        cursor:pointer;font-family:'IBM Plex Mono',monospace;letter-spacing:.06em;flex-shrink:0;transition:all .15s"
+        onmouseover="this.style.background='rgba(255,45,85,.28)'" onmouseout="this.style.background='rgba(255,45,85,.15)'">▼ SHORT</button>
+
+      <div style="width:1px;height:18px;background:rgba(100,210,255,.2);flex-shrink:0"></div>
+
+      <!-- Mode selector -->
+      <div style="display:flex;border-radius:5px;overflow:hidden;border:1px solid rgba(100,210,255,.25);flex-shrink:0">
+        <button id="vmc2T-modeManuel" onclick="_vmc2TSetMode('manuel')"
+          style="font-size:12px;font-weight:800;padding:5px 16px;border:none;
+          background:rgba(100,210,255,.15);color:var(--accent);cursor:pointer;
+          font-family:'IBM Plex Mono',monospace;letter-spacing:.06em;transition:all .2s">✋ MANUEL</button>
+        <button id="vmc2T-modeAuto" onclick="_vmc2TSetMode('auto')"
+          style="font-size:12px;font-weight:800;padding:5px 16px;border:none;
+          border-left:1px solid rgba(100,210,255,.25);background:transparent;
+          color:var(--muted2);cursor:pointer;font-family:'IBM Plex Mono',monospace;
+          letter-spacing:.06em;transition:all .2s">🤖 AUTO VMC</button>
+      </div>
+
+      <span id="vmc2T-status" style="font-size:11px;color:var(--muted2);margin-left:auto;font-family:'IBM Plex Mono',monospace;flex-shrink:0;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
     </div>
-    <span id="vmc2T-status" style="font-size:10px;color:var(--muted2);margin-left:auto;font-family:'IBM Plex Mono',monospace"></span>
+
+    <!-- ROW 2 — Preview prix / Settings AUTO / Position active -->
+    <div style="border-top:1px solid rgba(100,210,255,.07);padding:5px 16px;min-height:30px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
+
+      <!-- Previews (quand pas de trade) -->
+      <div id="vmc2T-previewRow" style="display:flex;align-items:center;gap:20px;flex-wrap:wrap">
+        <span style="font-size:11px;color:var(--muted2)">▲ SL <span id="vmc2T-slPreviewL" style="color:#ff6b6b;font-weight:700">—</span></span>
+        <span style="font-size:11px;color:var(--muted2)">▼ SL <span id="vmc2T-slPreviewS" style="color:#ff6b6b;font-weight:700">—</span></span>
+        <div style="width:1px;height:12px;background:rgba(100,210,255,.15)"></div>
+        <span style="font-size:11px;color:var(--muted2)">▲ TP <span id="vmc2T-tpPreviewL" style="color:#00e676;font-weight:700">—</span></span>
+        <span style="font-size:11px;color:var(--muted2)">▼ TP <span id="vmc2T-tpPreviewS" style="color:#00e676;font-weight:700">—</span></span>
+      </div>
+
+      <!-- AUTO Settings (quand mode AUTO, caché en mode MANUEL) -->
+      <div id="vmc2T-autoSettings" style="display:none;align-items:center;gap:10px;flex-wrap:wrap">
+        <span style="font-size:11px;color:var(--accent);font-weight:700;letter-spacing:.07em">LONG:</span>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:var(--text)">
+          <input type="checkbox" id="vmc2T-as-buyMain" checked style="accent-color:#00e676;width:13px;height:13px"> 🟢 BUY</label>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:var(--text)">
+          <input type="checkbox" id="vmc2T-as-buyGold" checked style="accent-color:#e2a400;width:13px;height:13px"> 🟡 GOLD</label>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:var(--text)">
+          <input type="checkbox" id="vmc2T-as-buyDiv" style="accent-color:#00e676;width:13px;height:13px"> 📈 Div+</label>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:var(--text)">
+          <input type="checkbox" id="vmc2T-as-buyDot" style="accent-color:#00e676;width:13px;height:13px"> · Tout cross↑</label>
+        <div style="width:1px;height:16px;background:rgba(100,210,255,.2);flex-shrink:0"></div>
+        <span style="font-size:11px;color:#ff6b6b;font-weight:700;letter-spacing:.07em">SHORT:</span>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:var(--text)">
+          <input type="checkbox" id="vmc2T-as-sellMain" checked style="accent-color:#ff2d55;width:13px;height:13px"> 🔴 SELL</label>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:var(--text)">
+          <input type="checkbox" id="vmc2T-as-sellDiv" style="accent-color:#ff2d55;width:13px;height:13px"> 📉 Div-</label>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:var(--text)">
+          <input type="checkbox" id="vmc2T-as-sellDot" style="accent-color:#ff2d55;width:13px;height:13px"> · Tout cross↓</label>
+        <div style="width:1px;height:16px;background:rgba(100,210,255,.2);flex-shrink:0"></div>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:#b47cff">
+          <input type="checkbox" id="vmc2T-as-exitSig" checked style="accent-color:#b47cff;width:13px;height:13px"> 🔄 Exit signal opposé</label>
+      </div>
+
+      <!-- Position active (quand en trade) -->
+      <div id="vmc2T-pos" style="display:none;align-items:center;gap:12px;flex-wrap:wrap">
+        <span id="vmc2T-posDir"   style="font-size:15px;font-weight:900;letter-spacing:.07em">—</span>
+        <span style="font-size:12px;color:var(--muted2)">@</span>
+        <span id="vmc2T-posEntry" style="font-size:14px;color:var(--text);font-weight:700">—</span>
+        <span style="font-size:12px;color:var(--muted2)">SL</span>
+        <span id="vmc2T-posSl"   style="font-size:14px;color:#ff6b6b;font-weight:700">—</span>
+        <span style="font-size:12px;color:var(--muted2)">TP</span>
+        <span id="vmc2T-posTp"   style="font-size:14px;color:#00e676;font-weight:700">—</span>
+        <span style="font-size:12px;color:var(--muted2)">P&L</span>
+        <span id="vmc2T-posPnl"  style="font-size:16px;font-weight:900">$0.00</span>
+        <button onclick="_vmc2TClose()"
+          style="font-size:12px;font-weight:700;padding:4px 14px;border-radius:4px;
+          border:1px solid rgba(255,45,85,.5);background:rgba(255,45,85,.1);
+          color:#ff6b6b;cursor:pointer;font-family:'IBM Plex Mono',monospace">✕ CLOSE</button>
+      </div>
+
+    </div>
   </div>
 
   <!-- Main body: price chart (top) + oscillator (bottom) -->
