@@ -18372,6 +18372,11 @@ let _vmc2SlPriceLine = null;   // draggable SL line ref
 let _vmc2TpPriceLine = null;   // draggable TP line ref
 let _vmc2TMarkers    = [];
 let _vmc2TPnlTimer   = null;
+let _vmc2TLev        = 1;      // leverage at trade open (stored to avoid DOM re-reads)
+let _vmc2TNotional   = 100;    // size × lev at open
+const _vmc2FeeRate   = 0.0004; // 0.04% taker fee per side (Binance/HyperLiquid standard)
+let _vmc2TWallet     = 0;      // accumulated capital (compounds after each trade)
+let _vmc2TWalletInit = false;  // wallet initialized flag
 
 function _vmc2TRefreshTpPreview() {
   // Prix actuel = dernière bougie tick ou barre VMC2
@@ -18383,12 +18388,15 @@ function _vmc2TRefreshTpPreview() {
 
   const slPct = parseFloat(document.getElementById('vmc2T-sl')?.value) || 1.5;
   const tpPct = parseFloat(document.getElementById('vmc2T-tp')?.value) || 3;
+  const levV  = parseFloat(document.getElementById('vmc2T-lev')?.value) || 1;
 
-  // Affiche LONG/SHORT dans les deux sens (▲ LONG TP, ▼ SHORT TP)
-  const slL = fmtPrice(price * (1 - slPct / 100));
-  const slS = fmtPrice(price * (1 + slPct / 100));
-  const tpL = fmtPrice(price * (1 + tpPct / 100));
-  const tpS = fmtPrice(price * (1 - tpPct / 100));
+  // SL/TP % are % of CAPITAL → divide by leverage to get price % move
+  const slMove = slPct / (100 * levV);
+  const tpMove = tpPct / (100 * levV);
+  const slL = fmtPrice(price * (1 - slMove));
+  const slS = fmtPrice(price * (1 + slMove));
+  const tpL = fmtPrice(price * (1 + tpMove));
+  const tpS = fmtPrice(price * (1 - tpMove));
 
   const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
   set('vmc2T-slPreviewL', slL);
@@ -18448,7 +18456,8 @@ function _vmc2CreateTradeOverlay() {
   if (!wrap || document.getElementById('vmc2TradeOverlay')) return;
   const cv = document.createElement('canvas');
   cv.id = 'vmc2TradeOverlay';
-  cv.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10';
+  // inset:0 covers the parent even in flex contexts where height:100% may fail
+  cv.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:10';
   wrap.appendChild(cv);
 }
 
@@ -18459,18 +18468,21 @@ function _vmc2DrawTradeOverlay() {
 }
 
 function _vmc2_doDrawOverlay() {
-  const cv = document.getElementById('vmc2TradeOverlay');
-  if (!cv || !_vmc2CandleSer) return;
-  const W = cv.offsetWidth;
-  const H = cv.offsetHeight;
+  const cv   = document.getElementById('vmc2TradeOverlay');
+  const wrap = document.getElementById('vmc2ChartWrap');
+  if (!cv || !wrap || !_vmc2CandleSer) return;
+  // Use the actual LWC container dimensions — priceToCoordinate() uses the same system
+  const W = wrap.clientWidth;
+  const H = wrap.clientHeight;
   if (!W || !H) return;
-  cv.width  = W;
-  cv.height = H;
+  // Only reset canvas size when dimensions change (avoids expensive realloc every frame)
+  if (cv.width !== W)  cv.width  = W;
+  if (cv.height !== H) cv.height = H;
   const ctx = cv.getContext('2d');
   ctx.clearRect(0, 0, W, H);
   if (!_vmc2TInTrade) return;
 
-  const rp    = (_vmc2RightPad() || 65) + 2; // stop before price-axis
+  const rp    = Math.max(76, _vmc2RightPad() || 76) + 2; // stop well before price-axis
   const lineW = W - rp;
 
   const lines = [
@@ -18622,13 +18634,14 @@ function _vmc2AttachDragListeners() {
 
 function _vmc2TUpdatePos(currentPrice) {
   if (!_vmc2TInTrade) return;
-  const size   = parseFloat(document.getElementById('vmc2T-size')?.value) || 100;
-  const lev    = parseFloat(document.getElementById('vmc2T-lev')?.value)  || 2;
-  const notional = size * lev;
-  const pnl = _vmc2TDir === 'LONG'
+  const notional = _vmc2TNotional; // stored at trade open (size × lev)
+  const grossPnl = _vmc2TDir === 'LONG'
     ? (currentPrice - _vmc2TEntry) / _vmc2TEntry * notional
     : (_vmc2TEntry - currentPrice) / _vmc2TEntry * notional;
-  _vmc2TPnl = pnl;
+  // Net = gross − round-trip fees (entry 0.04% + exit 0.04% = 0.08%)
+  const fees = notional * _vmc2FeeRate * 2;
+  const pnl  = grossPnl - fees;
+  _vmc2TPnl  = pnl;
   const pnlEl = document.getElementById('vmc2T-posPnl');
   if (pnlEl) { pnlEl.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`; pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)'; }
   // TP check
@@ -18648,14 +18661,22 @@ async function _vmc2TTrade(dir) {
   const coin  = _vmc2GetCoin();
   const paper = document.getElementById('vmc2T-paper')?.checked !== false;
   const size  = parseFloat(document.getElementById('vmc2T-size')?.value) || 100;
-  const lev   = parseFloat(document.getElementById('vmc2T-lev')?.value)  || 2;
+  const lev   = parseFloat(document.getElementById('vmc2T-lev')?.value)  || 1;
   const slPct = parseFloat(document.getElementById('vmc2T-sl')?.value)   || 1.5;
   const tpPct = parseFloat(document.getElementById('vmc2T-tp')?.value)   || 3;
+  // Store at trade open (avoids stale DOM reads later)
+  _vmc2TLev      = lev;
+  _vmc2TNotional = size * lev;
+  // Init wallet (compound capital) — only first time
+  if (!_vmc2TWalletInit) { _vmc2TWallet = size; _vmc2TWalletInit = true; }
   _vmc2TSetStatus('Fetching price…', 'var(--accent)');
   try {
     const entry = await hlPrice(coin);
-    const sl = dir === 'LONG' ? entry * (1 - slPct/100) : entry * (1 + slPct/100);
-    const tp = dir === 'LONG' ? entry * (1 + tpPct/100) : entry * (1 - tpPct/100);
+    // SL/TP % = % of CAPITAL → price move = % / leverage
+    const slMove = slPct / (100 * lev);
+    const tpMove = tpPct / (100 * lev);
+    const sl = dir === 'LONG' ? entry * (1 - slMove) : entry * (1 + slMove);
+    const tp = dir === 'LONG' ? entry * (1 + tpMove) : entry * (1 - tpMove);
     _vmc2TInTrade = true;
     _vmc2TDir     = dir;
     _vmc2TEntry   = entry;
@@ -18691,10 +18712,15 @@ async function _vmc2TClose(reason = 'Manual') {
   const paper = document.getElementById('vmc2T-paper')?.checked !== false;
   try {
     const price = await hlPrice(coin);
-    _vmc2TUpdatePos(price);
+    _vmc2TUpdatePos(price); // updates _vmc2TPnl (already net of fees)
     const pnl = _vmc2TPnl;
     if (pnl >= 0) _vmc2TWins++; else _vmc2TLosses++;
     if (!paper) await hlMarketOrder(coin, _vmc2TDir === 'SHORT', 0, 1);
+    // ── Compound capital: add net P&L to wallet ──
+    _vmc2TWallet += pnl;
+    const newSize = Math.max(10, _vmc2TWallet);
+    const sizeEl  = document.getElementById('vmc2T-size');
+    if (sizeEl) sizeEl.value = newSize.toFixed(2);
   } catch(e) {}
   _vmc2TInTrade = false;
   _vmc2TClearSignals();
@@ -18702,7 +18728,7 @@ async function _vmc2TClose(reason = 'Manual') {
   document.getElementById('vmc2T-longBtn').disabled   = false;
   document.getElementById('vmc2T-shortBtn').disabled  = false;
   const wr = _vmc2TWins + _vmc2TLosses > 0 ? Math.round(_vmc2TWins/(_vmc2TWins+_vmc2TLosses)*100) : 0;
-  _vmc2TSetStatus(`${reason} | WR ${wr}% (${_vmc2TWins}W/${_vmc2TLosses}L)`, _vmc2TPnl >= 0 ? 'var(--green)' : 'var(--red)');
+  _vmc2TSetStatus(`${reason} | WR ${wr}% (${_vmc2TWins}W/${_vmc2TLosses}L) | 💰 $${_vmc2TWallet.toFixed(2)}`, _vmc2TPnl >= 0 ? 'var(--green)' : 'var(--red)');
 }
 // ═════════════════════════════════════════════════════════════════════════
 
