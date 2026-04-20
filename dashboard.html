@@ -18326,34 +18326,43 @@ async function _vmc2StartTickMode(coin, bucketMs) {
 async function _vmc2Run() {
   if (_vmc2Running) return;
   _vmc2Running = true;
-  _vmc2StopTickMode(); // stop any live tick mode
-  _vmc2Status('Loading candles…', 'var(--accent)');
+  _vmc2StopTickMode();
+  _vmc2Status('Loading…', 'var(--accent)');
   try {
     const coin = _vmc2GetCoin();
     const tf   = _vmc2GetTF();
-    // ── Sub-minute: live tick mode ──
+
+    // ── Sub-minute : live tick mode (WebSocket) ──
     if (tf === '1s' || tf === '10s') {
       _vmc2Running = false;
       await _vmc2StartTickMode(coin, tf === '1s' ? 1000 : 10000);
       return;
     }
-    // ── Normal REST candles ──
-    const tfMsMap = { '1m':60e3,'5m':300e3,'15m':900e3,'30m':1800e3,'1h':3600e3,'4h':14400e3,'1d':86400e3 };
-    const tfMs = tfMsMap[tf] || 900e3;
-    const candles = await hlInfo({
-      type: 'candleSnapshot',
-      req: { coin, interval: tf, startTime: Date.now() - 600 * tfMs, endTime: Date.now() }
-    });
-    if (!Array.isArray(candles) || candles.length < 80) throw new Error('Not enough data');
+
+    // ── REST candles : 100 % Binance (plus de HyperLiquid) ──────────────
+    // Binance supporte : 1m 3m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d 3d 1w 1M
+    const bnSym = coin.toUpperCase() + 'USDT';
+    const r     = await fetch(`/bnproxy/api/v3/klines?symbol=${bnSym}&interval=${tf}&limit=601`);
+    const raw   = await r.json();
+    if (!Array.isArray(raw) || raw.length < 80) throw new Error(`Pas de données Binance pour ${bnSym} ${tf}`);
+
+    // Binance kline → format interne {t,o,h,l,c,v}
+    const candles = raw.map(c => ({
+      t: parseInt(c[0]),
+      o: parseFloat(c[1]), h: parseFloat(c[2]),
+      l: parseFloat(c[3]), c: parseFloat(c[4]),
+      v: parseFloat(c[5])
+    }));
+
     _vmc2InitChart();
     _vmc2FeedChart(candles);
     _vmc2Data = _v2Compute(candles);
     _vmc2Render();
     _vmc2UpdateSignalBar();
-    _vmc2TAutoCheck(); // ← auto-trade check on each REST refresh
+    _vmc2TAutoCheck();
     _vmc2Status(`${coin} ${tf} · ${candles.length} bars · ${new Date().toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`, 'var(--green)');
   } catch(e) {
-    _vmc2Status(`Error: ${e.message}`, 'var(--red)');
+    _vmc2Status(`⚠ ${e.message}`, 'var(--red)');
   }
   _vmc2Running = false;
 }
@@ -18477,6 +18486,7 @@ function _vmc2TSetStatus(msg, col = 'var(--muted2)') {
 // ── Mode MANUEL / AUTO VMC ────────────────────────────────────────────────
 function _vmc2TSetMode(mode) {
   _vmc2TAutoOn = (mode === 'auto');
+  if (mode === 'auto') _vmc2TLastSigBar = -1; // reset so signals fire immediately
   const mBtn    = document.getElementById('vmc2T-modeManuel');
   const aBtn    = document.getElementById('vmc2T-modeAuto');
   const longBtn = document.getElementById('vmc2T-longBtn');
@@ -18847,7 +18857,7 @@ async function _vmc2TAutoCheck() {
     if (_vmc2TDir === 'SHORT' && isBuy)  { _vmc2TLastSigBar = si; await _vmc2TClose('↺ Signal BUY');  return; }
   }
 
-  if (!isBuy && !isSell) return;
+  if (!isBuy && !isSell) { _vmc2TLastSigBar = si; return; } // marque la barre vérifiée
   const sigDir = isBuy ? 'LONG' : 'SHORT';
   if (_vmc2TInTrade && _vmc2TDir === sigDir) { _vmc2TLastSigBar = si; return; }
 
