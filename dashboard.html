@@ -18236,12 +18236,17 @@ async function _vmc2StartTickMode(coin, bucketMs) {
     } catch(e) {}
   };
 
-  // ── 3. Re-render périodique — LWC update() sur la bougie courante ────────
+  // ── 3. Re-render périodique ──────────────────────────────────────────────
+  // • 250 ms  : LWC candle update + P&L live (ultra smooth, no API call)
+  // • toutes les 1 s : VMC compute + oscillator redraw + auto-check
+  let _lastCompute = 0;
   _vmc2TickRenderTimer = setInterval(() => {
     if (!_vmc2TickCur || !_vmc2CandleSer) return;
     const cur  = { ..._vmc2TickCur };
     const bars = [..._vmc2TickBars, cur];
     if (bars.length < 20) return;
+
+    // ── Prix LWC — rafraîchi chaque 250 ms pour un mouvement fluide ──
     try {
       _vmc2CandleSer.update({ time: _lwcT(cur.t), open: cur.o, high: cur.h, low: cur.l, close: cur.c });
       if (_vmc2VolSer) _vmc2VolSer.update({
@@ -18250,12 +18255,22 @@ async function _vmc2StartTickMode(coin, bucketMs) {
         color: cur.c >= cur.o ? 'rgba(0,230,118,.3)' : 'rgba(255,45,85,.3)'
       });
     } catch(e) {}
-    _vmc2Data = _v2Compute(bars);
-    _vmc2Render();
-    _vmc2TAutoCheck();
-    if (!_vmc2TInTrade) _vmc2TRefreshTpPreview(); // live preview when flat
-    _vmc2Status(`⚡ ${coin} ${label} · ${bars.length}b · ${new Date().toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`, 'var(--green)');
-  }, Math.max(1000, bucketMs));
+
+    // ── P&L live — prix Binance direct, ZÉRO latence API ──
+    if (_vmc2TInTrade) _vmc2TUpdatePos(cur.c);
+    else               _vmc2TRefreshTpPreview();
+
+    // ── VMC compute (1 s max) — calcul indicateur pas besoin plus vite ──
+    const now = Date.now();
+    if (now - _lastCompute >= 1000) {
+      _lastCompute = now;
+      _vmc2Data = _v2Compute(bars);
+      _vmc2Render();
+      _vmc2TAutoCheck();
+      _vmc2UpdateSignalBar();
+      _vmc2Status(`⚡ ${coin} ${label} · ${bars.length}b · ${new Date().toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`, 'var(--green)');
+    }
+  }, 250); // 250 ms = 4 fps sur la bougie courante
 }
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -18669,9 +18684,10 @@ async function _vmc2TTrade(dir) {
   _vmc2TNotional = size * lev;
   // Init wallet (compound capital) — only first time
   if (!_vmc2TWalletInit) { _vmc2TWallet = size; _vmc2TWalletInit = true; }
-  _vmc2TSetStatus('Fetching price…', 'var(--accent)');
+  _vmc2TSetStatus('Entry…', 'var(--accent)');
   try {
-    const entry = await hlPrice(coin);
+    // Tick mode: use Binance live price (instant). REST mode: fallback to hlPrice.
+    const entry = _vmc2TickCur?.c || await hlPrice(coin);
     // SL/TP % = % of CAPITAL → price move = % / leverage
     const slMove = slPct / (100 * lev);
     const tpMove = tpPct / (100 * lev);
@@ -18695,10 +18711,13 @@ async function _vmc2TTrade(dir) {
     // Lignes pointillées : ENTRY (cyan) + SL (rouge) + TP (vert)
     _vmc2TDrawSignals(dir, entry, sl, tp);
     _vmc2TSetStatus(`${paper?'📋':'🔴'} ${dir} @ ${fmtPrice(entry)} | SL ${fmtPrice(sl)} | TP ${fmtPrice(tp)}`, dir === 'LONG' ? 'var(--green)' : 'var(--red)');
-    // Poll P&L every 2s
-    _vmc2TPnlTimer = setInterval(async () => {
-      try { const p = await hlPrice(coin); _vmc2TUpdatePos(p); } catch(e) {}
-    }, 2000);
+    // En tick-mode : le render timer (250 ms) met à jour le P&L via le prix Binance live.
+    // En REST mode (pas de tick WS) : fallback hlPrice toutes les 2s.
+    if (!_vmc2TickWs) {
+      _vmc2TPnlTimer = setInterval(async () => {
+        try { const p = await hlPrice(coin); _vmc2TUpdatePos(p); } catch(e) {}
+      }, 2000);
+    }
   } catch(e) {
     _vmc2TInTrade = false;
     _vmc2TSetStatus(`Error: ${e.message}`, 'var(--red)');
@@ -18707,11 +18726,13 @@ async function _vmc2TTrade(dir) {
 
 async function _vmc2TClose(reason = 'Manual') {
   if (!_vmc2TInTrade) return;
+  _vmc2TInTrade = false; // set immediately — prevents re-entry from render timer
   if (_vmc2TPnlTimer) { clearInterval(_vmc2TPnlTimer); _vmc2TPnlTimer = null; }
   const coin  = _vmc2GetCoin();
   const paper = document.getElementById('vmc2T-paper')?.checked !== false;
   try {
-    const price = await hlPrice(coin);
+    // Prefer live Binance tick price (zero latency) — fallback to hlPrice in REST mode
+    const price = _vmc2TickCur?.c || await hlPrice(coin);
     _vmc2TUpdatePos(price); // updates _vmc2TPnl (already net of fees)
     const pnl = _vmc2TPnl;
     if (pnl >= 0) _vmc2TWins++; else _vmc2TLosses++;
@@ -18722,7 +18743,7 @@ async function _vmc2TClose(reason = 'Manual') {
     const sizeEl  = document.getElementById('vmc2T-size');
     if (sizeEl) sizeEl.value = newSize.toFixed(2);
   } catch(e) {}
-  _vmc2TInTrade = false;
+  // _vmc2TInTrade already set false at top of function
   _vmc2TClearSignals();
   document.getElementById('vmc2T-pos').style.display  = 'none';
   document.getElementById('vmc2T-longBtn').disabled   = false;
