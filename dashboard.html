@@ -18839,6 +18839,9 @@ function _vmc2TUpdatePos(currentPrice) {
   const pnlEl = document.getElementById('vmc2T-posPnl');
   if (pnlEl) { pnlEl.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`; pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)'; }
 
+  // Mise à jour live du banner "En cours" dans le Trades Drawer si ouvert
+  if (document.getElementById('tradesDrawer')?.classList.contains('open')) _tdsRenderOpen();
+
   // ── Trailing Stop ────────────────────────────────────────────────────────
   if (_vmc2TTrailPct > 0) {
     const trailMove = _vmc2TTrailPct / 100;
@@ -19049,7 +19052,8 @@ async function _vmc2TAutoCheck() {
                                  || (d.wtCross[siCur] && d.wtCrossDown[siCur])));
 
   // ── Retournement auto : ferme le trade ET ouvre dans le sens opposé ──
-  if (_vmc2TInTrade && useExitSig) {
+  // Guard si > _vmc2TLastSigBar évite la cascade (même barre re-déclenche retournement)
+  if (_vmc2TInTrade && useExitSig && si > _vmc2TLastSigBar) {
     if (_vmc2TDir === 'LONG'  && isSell) { _vmc2TLastSigBar = si; await _vmc2TClose('↺ Retournement SHORT'); }
     else if (_vmc2TDir === 'SHORT' && isBuy)  { _vmc2TLastSigBar = si; await _vmc2TClose('↺ Retournement LONG'); }
     // fall-through → ouverture du trade dans le sens opposé ci-dessous
@@ -19190,7 +19194,32 @@ function _tdsUpdateStats() {
 function _tdsRenderOpen() {
   const banner = document.getElementById('tdsOpenBanner');
   if (!banner) return;
-  const t = (typeof openTrade !== 'undefined' ? openTrade : null);
+
+  // Priorité 1 : trade du système principal (openTrade)
+  let t = (typeof openTrade !== 'undefined' ? openTrade : null);
+  let isVmc2 = false;
+
+  // Priorité 2 : trade VMC Cipher B ouvert (_vmc2TInTrade)
+  if (!t && typeof _vmc2TInTrade !== 'undefined' && _vmc2TInTrade && _vmc2TEntry > 0) {
+    const price = (typeof currentPrice !== 'undefined' && currentPrice > 0) ? currentPrice : _vmc2TEntry;
+    const notional = _vmc2TNotional || _vmc2TSize || 100;
+    const grossPnl = _vmc2TDir === 'LONG'
+      ? (price - _vmc2TEntry) / _vmc2TEntry * notional
+      : (_vmc2TEntry - price) / _vmc2TEntry * notional;
+    const paper = document.getElementById('vmc2T-paper')?.checked !== false;
+    t = {
+      direction: _vmc2TDir,
+      sym:       _vmc2TCoin || 'VMC2',
+      entry:     _vmc2TEntry,
+      sl:        _vmc2TSl,
+      tp:        _vmc2TTp,
+      pnl:       grossPnl,
+      real:      !paper,
+      _source:   'vmc2'
+    };
+    isVmc2 = true;
+  }
+
   if (!t) { banner.style.display = 'none'; return; }
 
   const isL  = t.direction === 'LONG';
@@ -19199,20 +19228,22 @@ function _tdsRenderOpen() {
   const pnlC = pnl >= 0 ? 'var(--green)' : 'var(--red)';
   const sign = pnl >= 0 ? '+' : '';
   const cur  = typeof currentPrice !== 'undefined' ? fmtPrice(currentPrice) : '—';
+  const src  = isVmc2 ? '<span style="font-size:9px;color:var(--accent);opacity:.7">VMC2</span>' : '';
 
   banner.style.display = 'flex';
   banner.innerHTML = `
     <div style="display:flex;align-items:center;gap:10px;width:100%">
       <span style="font-size:11px;font-weight:700;color:${col};letter-spacing:.08em">${isL ? '▲' : '▼'} ${t.direction}</span>
       <span style="color:var(--muted2);font-size:10px">${t.sym || ''}</span>
+      ${src}
       <span style="font-size:10px;color:var(--muted2)">|</span>
       <span style="font-size:10px">ENT <span style="color:var(--accent)">${fmtPrice(t.entry)}</span></span>
       <span style="font-size:10px">NOW <span style="color:var(--muted)">${cur}</span></span>
       <span style="font-size:10px;margin-left:auto;font-weight:700;color:${pnlC}">${sign}$${pnl.toFixed(2)}</span>
     </div>
     <div style="display:flex;gap:12px;margin-top:4px;font-size:10px;color:var(--muted2)">
-      <span>SL <span style="color:#ff2d55">${fmtPrice(t.sl)}</span></span>
-      <span>TP <span style="color:var(--green)">${fmtPrice(t.tp)}</span></span>
+      <span>SL <span style="color:#ff2d55">${t.sl > 0 ? fmtPrice(t.sl) : '—'}</span></span>
+      <span>TP <span style="color:var(--green)">${t.tp > 0 ? fmtPrice(t.tp) : '—'}</span></span>
       <span>Size <span style="color:var(--muted)">${t.real ? '🔴 RÉEL' : '📋 PAPER'}</span></span>
     </div>`;
 }
