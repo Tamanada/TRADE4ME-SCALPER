@@ -1614,21 +1614,44 @@ function checkUTBotSignalPaper(){
     else if(t.tpP>0&&cur>=t.tpP){_uptClose('win',t.tpP,Date.now(),fee);}
   }
 
-  // Détection signal sur bougie N-2 (dernière fermée)
+  // ── Signal N-2 : dernière bougie FERMÉE (confirmée) ──────────────────────────
   if(n>=2){
     const pi=n-2;
     const pc=S.candles[pi];
-    const isBuy=_utbotData.buy[pi];
-    const isSell=_utbotData.sell[pi];
-    if(isBuy&&!UPT.inTrade&&pc.time>UPT.lastSigTime){
+    if(_utbotData.buy[pi]&&!UPT.inTrade&&pc.time>UPT.lastSigTime){
       UPT.lastSigTime=pc.time;
       _uptOpen(pc,sl,tp);
     }
-    if(isSell&&UPT.inTrade&&pc.time>UPT.lastSigTime){
+    if(_utbotData.sell[pi]&&UPT.inTrade&&pc.time>UPT.lastSigTime){
       UPT.lastSigTime=pc.time;
       _uptClose('signal',pc.close,pc.time,fee);
     }
   }
+
+  // ── Signal N-1 : bougie en cours — évite de manquer un signal récent ─────────
+  // Le signal peut avoir apparu il y a quelques secondes mais sera confirmé au
+  // prochain refresh. On entre au prix live WS si disponible.
+  if(n>=1&&!UPT.inTrade){
+    const ci=n-1;
+    const cc=S.candles[ci];
+    if(_utbotData.buy[ci]&&cc.time>UPT.lastSigTime){
+      UPT.lastSigTime=cc.time;
+      // Prix d'entrée = tick live WS (précis) ou close de la bougie courante
+      const entryP=UPT.livePrice>0?UPT.livePrice:cc.close;
+      _uptOpen({...cc,close:entryP},sl,tp);
+    }
+  }
+  // SELL sur N-1 si en position
+  if(n>=1&&UPT.inTrade){
+    const ci=n-1;
+    const cc=S.candles[ci];
+    if(_utbotData.sell[ci]&&cc.time>UPT.lastSigTime){
+      UPT.lastSigTime=cc.time;
+      const exitP=UPT.livePrice>0?UPT.livePrice:cc.close;
+      _uptClose('signal',exitP,cc.time,fee);
+    }
+  }
+
   renderUTBotPaperPanel();
   drawUTBotChart();
 }
