@@ -8013,6 +8013,14 @@ document.addEventListener('DOMContentLoaded', ()=>{
 });
 
 // ══════════════════════════════════════════════════════════
+//  HyperLiquid constants — declared EARLY to avoid TDZ if hlInfo()
+//  is called before the HL section (line ~11785) is reached
+// ══════════════════════════════════════════════════════════
+const HL_URL       = 'https://api.hyperliquid.xyz';
+const HL_CHAIN_ID  = 42161;     // Arbitrum mainnet
+const HL_TZ_OFFSET = 7 * 3600; // Bangkok UTC+7 — LightweightCharts offset
+
+// ══════════════════════════════════════════════════════════
 //  BOOT
 // ══════════════════════════════════════════════════════════
 // Sync SYMBOL avec la vraie valeur du dropdown (le navigateur peut restaurer ATOM, etc.)
@@ -8060,6 +8068,9 @@ setInterval(()=>{ if(activeTab==='indicators') updateIndCharts(); }, 30000);
 setInterval(()=>{ if(activeTab==='acp' && document.getElementById('acpAutoRefresh')?.checked) _acpRun(); }, 60000);
 // Score CLAUDE live — rafraîchi toutes les 2s quand actif
 setInterval(()=>{ if(_ctActive) _ctUpdateUI(); }, 2000);
+// VMC2 : restaure TF + coin sauvegardés, puis pré-charge la liste Binance
+_vmc2LoadPrefs();
+setTimeout(_vmc2PopulateTokenSelect, 1000);
 
 // ══════════════════════════════════════════════════════════
 //  BINANCE API ENGINE
@@ -11779,10 +11790,8 @@ function _csAddSymbol() {
 // ════════════════════════════════════════════════════════════
 // ⚡ HYPERLIQUID — API + Trading Engine
 // Maker 0% · Taker 0.035% · EIP-712 signing via ethers.js v5
+// HL_URL / HL_CHAIN_ID / HL_TZ_OFFSET declared early (before boot) to avoid TDZ
 // ════════════════════════════════════════════════════════════
-const HL_URL      = 'https://api.hyperliquid.xyz';
-const HL_CHAIN_ID = 42161; // Arbitrum mainnet
-const HL_TZ_OFFSET = 7 * 3600; // Bangkok UTC+7 — décalage pour affichage LightweightCharts
 
 let _hlActive  = false;
 let _hlInTrade = false;
@@ -16915,7 +16924,7 @@ async function _homeRefreshMarket() {
     }).filter(a => a.vol > 0);
     if (timeEl) timeEl.textContent = new Date().toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
     _hvMktRender();
-    _vmc2PopulateTokenSelect();
+    _vmc2PopulateTokenSelect(); // no-op after first call (cache hit)
   } catch(e) {
     if (body) body.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:20px;color:var(--red);font-size:11px">Error: ${e.message}</td></tr>`;
   }
@@ -18113,6 +18122,14 @@ function _vmc2FeedChart(candles) {
   try {
     _vmc2CandleSer.setData(lwcCandles);
     _vmc2VolSer.setData(volData);
+    // Auto-précision selon le prix (4 déc. pour ~1.37, 2 déc. pour >100, etc.)
+    if (lwcCandles.length) {
+      const lastClose = lwcCandles[lwcCandles.length - 1].close;
+      if (lastClose > 0) {
+        const pf = autopriceFormat(lastClose);
+        _vmc2CandleSer.applyOptions({ priceFormat: pf });
+      }
+    }
     // Sync visible range: show same last-N bars as canvas
     const n  = lwcCandles.length;
     const bv = _vmc2BarsVisible();
@@ -18125,19 +18142,84 @@ let _vmc2Running = false;
 let _vmc2Data    = null;
 let _vmc2Timer   = null;
 
-// ── Populate VMC2 token dropdown from live market data (alphabetical) ──
-function _vmc2PopulateTokenSelect() {
+// ── Populate VMC2 token dropdown — 100 % Binance USDT spot pairs ─────────
+let _vmc2BnSymbols = null; // cache — fetched once at boot
+
+async function _vmc2PopulateTokenSelect() {
   const sel = document.getElementById('vmc2-coin');
-  if (!sel || !_hvMktData || !_hvMktData.length) return;
+  if (!sel) return;
   const current = sel.value || 'BTC';
-  const tokens  = [..._hvMktData].map(d => d.name).sort((a, b) => a.localeCompare(b));
-  sel.innerHTML = tokens.map(t =>
-    `<option value="${t}"${t === current ? ' selected' : ''}>${t}</option>`
+
+  // Already fetched → just (re)render
+  if (_vmc2BnSymbols) {
+    const html = _vmc2BnSymbols.map(t =>
+      `<option value="${t}"${t === current ? ' selected' : ''}>${t}</option>`
+    ).join('');
+    if (sel.innerHTML !== html) sel.innerHTML = html;
+    if (sel.value !== current && _vmc2BnSymbols.includes(current)) sel.value = current;
+    return;
+  }
+
+  // Fetch all Binance USDT spot prices (lightweight — symbol+price only)
+  try {
+    const r    = await fetch('/bnproxy/api/v3/ticker/price');
+    const data = await r.json();
+    if (Array.isArray(data)) {
+      // Remove stablecoins, leveraged tokens, FDUSD pairs, etc.
+      const EXCLUDE = /^(USDC|BUSD|TUSD|USDS|DAI|FDUSD|UST|USDP|EUR|GBP|TRY|BRL|AUD|PAXG|AEUR)/;
+      const LV_SUFFIX = /(DOWN|UP|BULL|BEAR)USDT$/;
+      _vmc2BnSymbols = data
+        .filter(d => d.symbol.endsWith('USDT') && !LV_SUFFIX.test(d.symbol) && !EXCLUDE.test(d.symbol))
+        .map(d => d.symbol.slice(0, -4))  // strip "USDT"
+        .sort((a, b) => a.localeCompare(b));
+    }
+  } catch(e) {
+    console.warn('[VMC2] Binance symbol list failed, using HyperLiquid fallback:', e.message);
+    // Fallback : HyperLiquid list if available
+    if (_hvMktData?.length) {
+      _vmc2BnSymbols = [..._hvMktData].map(d => d.name).sort((a, b) => a.localeCompare(b));
+    }
+  }
+
+  if (!_vmc2BnSymbols?.length) return;
+  // Apply saved coin preference (set by _vmc2LoadPrefs before options existed)
+  const prefCoin = window._vmc2PrefCoin || current;
+  sel.innerHTML = _vmc2BnSymbols.map(t =>
+    `<option value="${t}"${t === prefCoin ? ' selected' : ''}>${t}</option>`
   ).join('');
+  // Keep previously selected coin if it exists on Binance, else default BTC
+  if (_vmc2BnSymbols.includes(prefCoin)) sel.value = prefCoin;
+  else sel.value = 'BTC';
+  window._vmc2PrefCoin = null; // consumed
 }
 
 function _vmc2GetCoin() { return (document.getElementById('vmc2-coin')?.value?.trim() || 'BTC').toUpperCase(); }
 function _vmc2GetTF()   { return document.getElementById('vmc2-tf')?.value || '4h'; }
+
+function _vmc2SavePrefs() {
+  try {
+    localStorage.setItem('vmc2_tf',   _vmc2GetTF());
+    localStorage.setItem('vmc2_coin', _vmc2GetCoin());
+  } catch(e) {}
+}
+function _vmc2LoadPrefs() {
+  try {
+    const tf   = localStorage.getItem('vmc2_tf');
+    const coin = localStorage.getItem('vmc2_coin');
+    const tfEl = document.getElementById('vmc2-tf');
+    if (tf && tfEl) {
+      // find matching option, fallback to 4h
+      const opt = tfEl.querySelector(`option[value="${tf}"]`);
+      if (opt) tfEl.value = tf;
+      else     tfEl.value = '4h';
+    }
+    if (coin) {
+      const coinEl = document.getElementById('vmc2-coin');
+      if (coinEl) coinEl.value = coin; // will be corrected once options are populated
+      window._vmc2PrefCoin = coin; // save for after async populate
+    }
+  } catch(e) {}
+}
 function _vmc2Status(msg, col = 'var(--muted2)') {
   const el = document.getElementById('vmc2-status');
   if (el) { el.textContent = msg; el.style.color = col; }
@@ -18145,6 +18227,7 @@ function _vmc2Status(msg, col = 'var(--muted2)') {
 
 // ══ VMC2 Tick Mode — 1s / 10s via Binance WebSocket ══════════════════════
 let _vmc2TickWs          = null;
+let _vmc2RunGen          = 0;   // génération — annule les runs périmés
 let _vmc2TickBars        = [];
 let _vmc2TickBucket      = 1000;
 let _vmc2TickCur         = null;
@@ -18165,23 +18248,39 @@ async function _vmc2BnPrice(coin) {
   } catch(e) { return hlPrice(coin); } // fallback
 }
 
-async function _vmc2StartTickMode(coin, bucketMs) {
+// ── TF string → Binance interval (native kline WS supported for all below) ──
+const _vmc2TfToInterval = {
+  '1s':'1s', '1m':'1m', '3m':'3m', '5m':'5m', '15m':'15m', '30m':'30m',
+  '1h':'1h', '2h':'2h', '4h':'4h', '6h':'6h', '8h':'8h', '12h':'12h',
+  '1d':'1d', '3d':'3d', '1w':'1w',
+  // '10s' intentionally absent → aggTrade path
+};
+
+// ── Unified live engine — ALL TFs use a Binance WebSocket ─────────────────
+// • 1s, 1m … 1d : @kline_{tf}  — native OHLCV stream, zero aggregation
+// • 10s          : @aggTrade    — manual bucket (no native 10s stream)
+// The 250 ms render timer updates LWC + P&L every tick, VMC every 1 s.
+async function _vmc2StartTickMode(coin, tf) {
   _vmc2StopTickMode();
-  _vmc2TickBucket = bucketMs;
-  const is1s   = bucketMs === 1000;
-  const label  = is1s ? '1s' : '10s';
-  const bnSym  = coin.toUpperCase() + 'USDT';
-  const bnSymL = bnSym.toLowerCase();
-  _vmc2Status(`⚡ Chargement ${coin} ${label} (Binance)…`, 'var(--accent)');
+  const gen        = ++_vmc2RunGen; // session ID — si gen !== _vmc2RunGen → périmé
+  const bnInterval = _vmc2TfToInterval[tf] || null; // null = 10s aggTrade path
+  const is10s      = (tf === '10s');
+  const label      = tf;
+  const bnSym      = coin.toUpperCase() + 'USDT';
+  const bnSymL     = bnSym.toLowerCase();
+  _vmc2Status(`⚡ Chargement ${coin} ${tf} (Binance)…`, 'var(--accent)');
 
   // ════════════════════════════════════════════════════════════════════════
   // ── 1. PRÉCHARGE HISTORIQUE ────────────────────────────────────────────
   // ════════════════════════════════════════════════════════════════════════
   try {
-    if (is1s) {
-      // ── 1s : Binance supporte interval=1s nativement → vraies bougies ──
-      const r   = await fetch(`/bnproxy/api/v3/klines?symbol=${bnSym}&interval=1s&limit=500`);
+    if (bnInterval) {
+      // Native kline TF : direct REST load (1s → 500 bars, all others → 601)
+      const limit = bnInterval === '1s' ? 500 : 601;
+      const r   = await fetch(`/bnproxy/api/v3/klines?symbol=${bnSym}&interval=${bnInterval}&limit=${limit}`);
+      if (gen !== _vmc2RunGen) return; // TF changée pendant le fetch → abandon
       const raw = await r.json();
+      if (gen !== _vmc2RunGen) return;
       if (Array.isArray(raw) && raw.length > 0) {
         _vmc2TickBars = raw.map(c => ({
           t: parseInt(c[0]),
@@ -18189,10 +18288,10 @@ async function _vmc2StartTickMode(coin, bucketMs) {
           l: parseFloat(c[3]), c: parseFloat(c[4]),
           v: parseFloat(c[5])
         }));
-        if (_vmc2TickBars.length > 600) _vmc2TickBars = _vmc2TickBars.slice(-600);
+        if (_vmc2TickBars.length > 601) _vmc2TickBars = _vmc2TickBars.slice(-601);
       }
     } else {
-      // ── 10s : pas de stream natif → interpolation depuis klines 1m ──
+      // 10s : pas de stream natif → interpolation depuis klines 1m ──
       const r   = await fetch(`/bnproxy/api/v3/klines?symbol=${bnSym}&interval=1m&limit=105`);
       const raw = await r.json();
       if (Array.isArray(raw) && raw.length > 0) {
@@ -18223,35 +18322,45 @@ async function _vmc2StartTickMode(coin, bucketMs) {
     _vmc2Data = _v2Compute(_vmc2TickBars);
     _vmc2Render();
     _vmc2UpdateSignalBar();
-    _vmc2Status(`⚡ ${coin} ${label} · ${_vmc2TickBars.length} bars · WS…`, 'var(--yellow)');
+    // Vérifier les signaux sur la dernière bougie fermée (avant que le WS se connecte)
+    _vmc2TAutoCheck();
+    _vmc2Status(`⚡ ${coin} ${tf} · ${_vmc2TickBars.length} bars · WS…`, 'var(--yellow)');
   } catch(e) { console.warn('[VMC2 prefill]', e.message); }
 
+  if (gen !== _vmc2RunGen) return; // TF changée pendant le préchargement → abandon
+
+  // ── Afficher les secondes sur l'axe temps pour 1s / 10s ──
+  if (_vmc2LwcChart) {
+    _vmc2LwcChart.applyOptions({
+      timeScale: { secondsVisible: (tf === '1s' || tf === '10s') }
+    });
+  }
+
   // ════════════════════════════════════════════════════════════════════════
-  // ── 2. WEBSOCKET LIVE ─────────────────────────────────────════════════
+  // ── 2. WEBSOCKET LIVE ────────────────────────────────────────────────
   // ════════════════════════════════════════════════════════════════════════
-  const streamName = is1s
-    ? `${bnSymL}@kline_1s`   // ← bougies 1s natives Binance (OHLCV exact + flag x)
-    : `${bnSymL}@aggTrade`;  // ← agrégation manuelle pour 10s
+  const streamName = bnInterval
+    ? `${bnSymL}@kline_${bnInterval}` // ← native kline stream (1s, 1m, 4h, …)
+    : `${bnSymL}@aggTrade`;           // ← 10s : agrégation manuelle
 
   const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${streamName}`);
   _vmc2TickWs = ws;
 
-  ws.onopen  = () => _vmc2Status(`⚡ ${coin} ${label} · LIVE (Binance)`, 'var(--green)');
-  ws.onerror = () => _vmc2Status(`⚡ ${coin} WS erreur — reconnexion…`, 'var(--red)');
-  ws.onclose = () => { if (_vmc2TickWs === ws) _vmc2Status(`⚡ ${coin} WS fermé`, 'var(--yellow)'); };
+  ws.onopen  = () => { if (gen === _vmc2RunGen) _vmc2Status(`⚡ ${coin} ${tf} · LIVE (Binance)`, 'var(--green)'); };
+  ws.onerror = () => { if (gen === _vmc2RunGen) _vmc2Status(`⚡ ${coin} WS erreur`, 'var(--red)'); };
+  ws.onclose = () => { if (_vmc2TickWs === ws && gen === _vmc2RunGen) _vmc2Status(`⚡ ${coin} WS fermé`, 'var(--yellow)'); };
 
-  if (is1s) {
-    // ── @kline_1s : OHLCV fourni par Binance — ZERO agrégation manuelle ──
+  if (bnInterval) {
+    // ── @kline_{tf} : même format pour 1s, 1m, 5m, 4h, 1d … ──
     ws.onmessage = ev => {
+      if (gen !== _vmc2RunGen) { ws.close(); return; } // session périmée → ferme le WS
       try {
         const k     = JSON.parse(ev.data).k;
-        const barTs = parseInt(k.t); // open time de la bougie 1s
-        // Archiver la bougie précédente quand une nouvelle commence
+        const barTs = parseInt(k.t);
         if (_vmc2TickCur && barTs !== _vmc2TickCur.t) {
           _vmc2TickBars.push({ ..._vmc2TickCur });
-          if (_vmc2TickBars.length > 600) _vmc2TickBars.shift();
+          if (_vmc2TickBars.length > 601) _vmc2TickBars.shift();
         }
-        // Mettre à jour la bougie courante avec les données Binance exactes
         _vmc2TickCur = {
           t: barTs,
           o: parseFloat(k.o), h: parseFloat(k.h),
@@ -18263,6 +18372,7 @@ async function _vmc2StartTickMode(coin, bucketMs) {
   } else {
     // ── @aggTrade : agrégation manuelle pour bougies 10s ──
     ws.onmessage = ev => {
+      if (gen !== _vmc2RunGen) { ws.close(); return; } // session périmée
       try {
         const msg   = JSON.parse(ev.data);
         const price = parseFloat(msg.p);
@@ -18285,86 +18395,66 @@ async function _vmc2StartTickMode(coin, bucketMs) {
   }
 
   // ════════════════════════════════════════════════════════════════════════
-  // ── 3. RENDER TIMER 250 ms ──────────────────────────────════════════════
-  // • 250 ms : LWC candle + P&L (Binance prix direct)
-  // • 1 s    : VMC compute + oscillator + signal check
+  // ── 3. RENDER TIMER 250 ms ──────────────────────────────────────────────
+  // • 250 ms : LWC candle + P&L (prix Binance live, 0 latence)
+  // • 1 s    : VMC compute + oscillator + signal auto-check
   // ════════════════════════════════════════════════════════════════════════
   let _lastCompute = 0;
   _vmc2TickRenderTimer = setInterval(() => {
-    if (!_vmc2TickCur || !_vmc2CandleSer) return;
-    const cur  = { ..._vmc2TickCur };
-    const bars = [..._vmc2TickBars, cur];
+    if (gen !== _vmc2RunGen) { clearInterval(_vmc2TickRenderTimer); return; } // périmé
+    if (!_vmc2CandleSer) return;
+
+    // Si le WS n'a pas encore envoyé de données, utiliser le dernier bar historique
+    const cur  = _vmc2TickCur ?? (_vmc2TickBars.length ? _vmc2TickBars[_vmc2TickBars.length - 1] : null);
+    if (!cur) return;
+    const bars = _vmc2TickCur ? [..._vmc2TickBars, cur] : _vmc2TickBars;
     if (bars.length < 20) return;
 
-    // LWC : rafraîchit la bougie courante 4× par seconde
-    try {
-      _vmc2CandleSer.update({ time: _lwcT(cur.t), open: cur.o, high: cur.h, low: cur.l, close: cur.c });
-      if (_vmc2VolSer) _vmc2VolSer.update({
-        time: _lwcT(cur.t), value: cur.v,
-        color: cur.c >= cur.o ? 'rgba(0,230,118,.3)' : 'rgba(255,45,85,.3)'
-      });
-    } catch(e) {}
-
-    // P&L live : prix Binance déjà en mémoire → 0 ms latence
+    // LWC : met à jour la bougie courante 4× par seconde (seulement si WS actif)
+    if (_vmc2TickCur) {
+      try {
+        _vmc2CandleSer.update({ time: _lwcT(cur.t), open: cur.o, high: cur.h, low: cur.l, close: cur.c });
+        if (_vmc2VolSer) _vmc2VolSer.update({
+          time: _lwcT(cur.t), value: cur.v,
+          color: cur.c >= cur.o ? 'rgba(0,230,118,.3)' : 'rgba(255,45,85,.3)'
+        });
+      } catch(e) {}
+    }
+    // P&L + TP/SL : toujours actif même si WS tarde (utilise last known price)
     if (_vmc2TInTrade) _vmc2TUpdatePos(cur.c);
-    else               _vmc2TRefreshTpPreview();
+    else if (_vmc2TickCur) _vmc2TRefreshTpPreview();
 
-    // VMC compute : throttlé à 1 s (inutile de recalculer 4× par seconde)
+    // VMC compute + oscillator + signaux : throttlé à 1 s
     const now = Date.now();
     if (now - _lastCompute >= 1000) {
       _lastCompute = now;
       _vmc2Data = _v2Compute(bars);
       _vmc2Render();
-      _vmc2TAutoCheck();
+      _vmc2TAutoCheck(); // fonctionne même sans WS (utilise les bars historiques)
       _vmc2UpdateSignalBar();
-      _vmc2Status(`⚡ ${coin} ${label} · ${bars.length}b · ${new Date().toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`, 'var(--green)');
+      if (_vmc2TickCur) {
+        _vmc2Status(`⚡ ${coin} ${tf} · ${bars.length}b · ${new Date().toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`, 'var(--green)');
+      }
     }
   }, 250);
 }
 // ══════════════════════════════════════════════════════════════════════════
 
 async function _vmc2Run() {
+  // Stopper l'ancienne session immédiatement, même si une autre est en cours
+  _vmc2StopTickMode();
   if (_vmc2Running) return;
   _vmc2Running = true;
-  _vmc2StopTickMode();
   _vmc2Status('Loading…', 'var(--accent)');
+  const coin = _vmc2GetCoin();
+  const tf   = _vmc2GetTF();
   try {
-    const coin = _vmc2GetCoin();
-    const tf   = _vmc2GetTF();
-
-    // ── Sub-minute : live tick mode (WebSocket) ──
-    if (tf === '1s' || tf === '10s') {
-      _vmc2Running = false;
-      await _vmc2StartTickMode(coin, tf === '1s' ? 1000 : 10000);
-      return;
-    }
-
-    // ── REST candles : 100 % Binance (plus de HyperLiquid) ──────────────
-    // Binance supporte : 1m 3m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d 3d 1w 1M
-    const bnSym = coin.toUpperCase() + 'USDT';
-    const r     = await fetch(`/bnproxy/api/v3/klines?symbol=${bnSym}&interval=${tf}&limit=601`);
-    const raw   = await r.json();
-    if (!Array.isArray(raw) || raw.length < 80) throw new Error(`Pas de données Binance pour ${bnSym} ${tf}`);
-
-    // Binance kline → format interne {t,o,h,l,c,v}
-    const candles = raw.map(c => ({
-      t: parseInt(c[0]),
-      o: parseFloat(c[1]), h: parseFloat(c[2]),
-      l: parseFloat(c[3]), c: parseFloat(c[4]),
-      v: parseFloat(c[5])
-    }));
-
-    _vmc2InitChart();
-    _vmc2FeedChart(candles);
-    _vmc2Data = _v2Compute(candles);
-    _vmc2Render();
-    _vmc2UpdateSignalBar();
-    _vmc2TAutoCheck();
-    _vmc2Status(`${coin} ${tf} · ${candles.length} bars · ${new Date().toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`, 'var(--green)');
+    await _vmc2StartTickMode(coin, tf);
   } catch(e) {
     _vmc2Status(`⚠ ${e.message}`, 'var(--red)');
+  } finally {
+    _vmc2Running = false;
   }
-  _vmc2Running = false;
 }
 
 function _vmc2Render() {
@@ -18447,6 +18537,36 @@ let _vmc2TMarkers    = [];
 let _vmc2TPnlTimer   = null;
 let _vmc2TLev        = 1;      // leverage at trade open (stored to avoid DOM re-reads)
 let _vmc2TNotional   = 100;    // size × lev at open
+let _vmc2TOpenTime   = 0;      // timestamp ms at trade open (for duration)
+let _vmc2TSize       = 100;    // capital engagé (pour export)
+let _vmc2TCoin       = 'BTC';  // coin au moment du trade (pour export)
+let _vmc2TTrailPct   = 0;      // trailing stop % (0 = désactivé)
+let _vmc2TTrailHigh  = 0;      // high-water mark pour LONG
+let _vmc2TTrailLow   = Infinity; // low-water mark pour SHORT
+let _vmc2TTrailSL    = 0;      // trail SL courant (prix)
+let _vmc2TChronoInt  = null;   // setInterval du chrono visible
+
+function _vmc2TStartChrono() {
+  _vmc2TStopChrono();
+  const el = document.getElementById('vmc2T-chrono');
+  if (!el) return;
+  const start = _vmc2TOpenTime || Date.now();
+  _vmc2TChronoInt = setInterval(() => {
+    const s   = Math.floor((Date.now() - start) / 1000);
+    const h   = Math.floor(s / 3600);
+    const m   = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    el.textContent = h > 0
+      ? `⏱ ${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
+      : `⏱ ${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+  }, 1000);
+}
+
+function _vmc2TStopChrono() {
+  if (_vmc2TChronoInt) { clearInterval(_vmc2TChronoInt); _vmc2TChronoInt = null; }
+  const el = document.getElementById('vmc2T-chrono');
+  if (el) el.textContent = '⏱ 00:00';
+}
 const _vmc2FeeRate   = 0.0004; // 0.04% taker fee per side (Binance/HyperLiquid standard)
 let _vmc2TWallet     = 0;      // accumulated capital (compounds after each trade)
 let _vmc2TWalletInit = false;  // wallet initialized flag
@@ -18561,8 +18681,9 @@ function _vmc2_doDrawOverlay() {
 
   const lines = [
     { price: _vmc2TEntry, color: '#64d2ff', dash: [4,4], lw: 1, tag: `ENTRY ${fmtPrice(_vmc2TEntry)}` },
-    { price: _vmc2TSl,    color: '#ff2d55', dash: [6,3], lw: 2, tag: `SL ${fmtPrice(_vmc2TSl)}` },
   ];
+  if (_vmc2TSl > 0)
+    lines.push({ price: _vmc2TSl, color: '#ff2d55', dash: [6,3], lw: 2, tag: `SL ${fmtPrice(_vmc2TSl)}` });
   if (_vmc2TTp > 0)
     lines.push({ price: _vmc2TTp, color: '#00e676', dash: [6,3], lw: 2, tag: `TP ${fmtPrice(_vmc2TTp)}` });
 
@@ -18708,25 +18829,54 @@ function _vmc2AttachDragListeners() {
 
 function _vmc2TUpdatePos(currentPrice) {
   if (!_vmc2TInTrade) return;
-  const notional = _vmc2TNotional; // stored at trade open (size × lev)
+  const notional = _vmc2TNotional;
   const grossPnl = _vmc2TDir === 'LONG'
     ? (currentPrice - _vmc2TEntry) / _vmc2TEntry * notional
     : (_vmc2TEntry - currentPrice) / _vmc2TEntry * notional;
-  // Net = gross − round-trip fees (entry 0.04% + exit 0.04% = 0.08%)
   const fees = notional * _vmc2FeeRate * 2;
   const pnl  = grossPnl - fees;
   _vmc2TPnl  = pnl;
   const pnlEl = document.getElementById('vmc2T-posPnl');
   if (pnlEl) { pnlEl.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`; pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)'; }
-  // TP check
+
+  // ── Trailing Stop ────────────────────────────────────────────────────────
+  if (_vmc2TTrailPct > 0) {
+    const trailMove = _vmc2TTrailPct / 100;
+    if (_vmc2TDir === 'LONG') {
+      if (currentPrice > _vmc2TTrailHigh) {
+        _vmc2TTrailHigh = currentPrice;
+        _vmc2TTrailSL   = _vmc2TTrailHigh * (1 - trailMove);
+        // Afficher le trail SL dans le champ SL de la position
+        const slEl = document.getElementById('vmc2T-posSl');
+        if (slEl) { slEl.textContent = `~${fmtPrice(_vmc2TTrailSL)}`; slEl.style.color = '#e2a400'; }
+      }
+      if (_vmc2TTrailHigh > _vmc2TEntry && currentPrice <= _vmc2TTrailSL) {
+        _vmc2TClose(`Trail ✕ ${_vmc2TTrailPct}%`); return;
+      }
+    } else { // SHORT
+      if (currentPrice < _vmc2TTrailLow) {
+        _vmc2TTrailLow = currentPrice;
+        _vmc2TTrailSL  = _vmc2TTrailLow * (1 + trailMove);
+        const slEl = document.getElementById('vmc2T-posSl');
+        if (slEl) { slEl.textContent = `~${fmtPrice(_vmc2TTrailSL)}`; slEl.style.color = '#e2a400'; }
+      }
+      if (_vmc2TTrailLow < _vmc2TEntry && currentPrice >= _vmc2TTrailSL) {
+        _vmc2TClose(`Trail ✕ ${_vmc2TTrailPct}%`); return;
+      }
+    }
+  }
+
+  // ── TP check ─────────────────────────────────────────────────────────────
   const tpHit = (_vmc2TTp > 0) && (
     (_vmc2TDir === 'LONG'  && currentPrice >= _vmc2TTp) ||
     (_vmc2TDir === 'SHORT' && currentPrice <= _vmc2TTp)
   );
   if (tpHit) { _vmc2TClose('TP ★'); return; }
-  // SL check
-  const slHit = (_vmc2TDir === 'LONG' && currentPrice <= _vmc2TSl) ||
-                (_vmc2TDir === 'SHORT' && currentPrice >= _vmc2TSl);
+  // ── SL check ─────────────────────────────────────────────────────────────
+  const slHit = (_vmc2TSl > 0) && (
+    (_vmc2TDir === 'LONG'  && currentPrice <= _vmc2TSl) ||
+    (_vmc2TDir === 'SHORT' && currentPrice >= _vmc2TSl)
+  );
   if (slHit) _vmc2TClose('SL ✕');
 }
 
@@ -18739,18 +18889,28 @@ async function _vmc2TTrade(dir) {
   const slPct = parseFloat(document.getElementById('vmc2T-sl')?.value)   || 1.5;
   const tpPct = parseFloat(document.getElementById('vmc2T-tp')?.value)   || 3;
   // Store at trade open (avoids stale DOM reads later)
-  _vmc2TLev      = lev;
-  _vmc2TNotional = size * lev;
+  _vmc2TLev       = lev;
+  _vmc2TNotional  = size * lev;
+  _vmc2TOpenTime  = Date.now();
+  _vmc2TSize      = size;
+  _vmc2TCoin      = coin;
+  _vmc2TTrailPct  = parseFloat(document.getElementById('vmc2T-trail')?.value) || 0;
+  _vmc2TTrailHigh = 0;
+  _vmc2TTrailLow  = Infinity;
+  _vmc2TTrailSL   = 0;
   // Init wallet (compound capital) — only first time
   if (!_vmc2TWalletInit) { _vmc2TWallet = size; _vmc2TWalletInit = true; }
   _vmc2TSetStatus('Entry…', 'var(--accent)');
   try {
     const entry = await _vmc2BnPrice(coin);
-    // SL/TP % = % of CAPITAL → price move = % / leverage
-    const slMove = slPct / (100 * lev);
-    const tpMove = tpPct / (100 * lev);
-    const sl = dir === 'LONG' ? entry * (1 - slMove) : entry * (1 + slMove);
-    const tp = dir === 'LONG' ? entry * (1 + tpMove) : entry * (1 - tpMove);
+    // En mode AUTO : SL/TP désactivés — sortie sur signal VMC uniquement
+    let sl = 0, tp = 0;
+    if (!_vmc2TAutoOn) {
+      const slMove = slPct / (100 * lev);
+      const tpMove = tpPct / (100 * lev);
+      sl = dir === 'LONG' ? entry * (1 - slMove) : entry * (1 + slMove);
+      tp = dir === 'LONG' ? entry * (1 + tpMove) : entry * (1 - tpMove);
+    }
     _vmc2TInTrade = true;
     _vmc2TDir     = dir;
     _vmc2TEntry   = entry;
@@ -18764,11 +18924,16 @@ async function _vmc2TTrade(dir) {
     const dirEl = document.getElementById('vmc2T-posDir');
     if (dirEl) { dirEl.textContent = dir; dirEl.style.color = dir === 'LONG' ? 'var(--green)' : 'var(--red)'; }
     document.getElementById('vmc2T-posEntry').textContent = fmtPrice(entry);
-    document.getElementById('vmc2T-posSl').textContent    = fmtPrice(sl);
-    document.getElementById('vmc2T-posTp').textContent    = fmtPrice(tp);
-    // Lignes pointillées : ENTRY (cyan) + SL (rouge) + TP (vert)
+    document.getElementById('vmc2T-posSl').textContent    = sl > 0 ? fmtPrice(sl) : '—';
+    document.getElementById('vmc2T-posTp').textContent    = tp > 0 ? fmtPrice(tp) : '—';
+    // Chrono visible
+    _vmc2TStartChrono();
+    // Lignes pointillées : ENTRY (cyan) + SL/TP seulement en mode MANUEL
     _vmc2TDrawSignals(dir, entry, sl, tp);
-    _vmc2TSetStatus(`${paper?'📋':'🔴'} ${dir} @ ${fmtPrice(entry)} | SL ${fmtPrice(sl)} | TP ${fmtPrice(tp)}`, dir === 'LONG' ? 'var(--green)' : 'var(--red)');
+    const slTpInfo = _vmc2TAutoOn
+      ? '🤖 sortie sur signal'
+      : `SL ${fmtPrice(sl)} | TP ${fmtPrice(tp)}`;
+    _vmc2TSetStatus(`${paper?'📋':'🔴'} ${dir} @ ${fmtPrice(entry)} | ${slTpInfo}`, dir === 'LONG' ? 'var(--green)' : 'var(--red)');
     // En tick-mode : le render timer (250 ms) met à jour le P&L via le prix Binance live.
     // En REST mode (pas de tick WS) : fallback hlPrice toutes les 2s.
     if (!_vmc2TickWs) {
@@ -18787,27 +18952,52 @@ async function _vmc2TClose(reason = 'Manual') {
   if (!_vmc2TInTrade) return;
   _vmc2TInTrade = false; // set immediately — prevents re-entry from render timer
   if (_vmc2TPnlTimer) { clearInterval(_vmc2TPnlTimer); _vmc2TPnlTimer = null; }
-  const coin  = _vmc2GetCoin();
+  const coin  = _vmc2TCoin || _vmc2GetCoin();
   const paper = document.getElementById('vmc2T-paper')?.checked !== false;
+  const openTime = _vmc2TOpenTime || Date.now();
   try {
-    const price = await _vmc2BnPrice(coin);
+    const price    = await _vmc2BnPrice(coin);
     _vmc2TUpdatePos(price); // updates _vmc2TPnl (already net of fees)
-    const pnl = _vmc2TPnl;
+    const pnl      = _vmc2TPnl;
+    const durMs    = Date.now() - openTime;
+    const pct      = _vmc2TNotional > 0 ? (pnl / _vmc2TSize) * 100 : 0;
     if (pnl >= 0) _vmc2TWins++; else _vmc2TLosses++;
     if (!paper) await hlMarketOrder(coin, _vmc2TDir === 'SHORT', 0, 1);
+    // ── Push to shared tradeHistory (feeds the Trades Drawer + CSV export) ──
+    const now = new Date();
+    tradeHistory.unshift({
+      date:      now.toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit' }),
+      time:      now.toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }),
+      direction: _vmc2TDir,
+      entry:     _vmc2TEntry,
+      exit:      price,
+      size:      _vmc2TSize,
+      lev:       _vmc2TLev,
+      sym:       coin + 'USDT',
+      pnl,
+      pct,
+      duration:  durMs,
+      reason,
+      real:      !paper,
+      src:       'vmc2',   // source tag
+    });
+    try { localStorage.setItem('trade_history', JSON.stringify(tradeHistory.slice(0, 200))); } catch(e) {}
     // ── Compound capital: add net P&L to wallet ──
     _vmc2TWallet += pnl;
     const newSize = Math.max(10, _vmc2TWallet);
     const sizeEl  = document.getElementById('vmc2T-size');
     if (sizeEl) sizeEl.value = newSize.toFixed(2);
   } catch(e) {}
-  // _vmc2TInTrade already set false at top of function
+  // ── UI cleanup ──
+  _vmc2TStopChrono();
   _vmc2TClearSignals();
   document.getElementById('vmc2T-pos').style.display  = 'none';
   document.getElementById('vmc2T-longBtn').disabled   = false;
   document.getElementById('vmc2T-shortBtn').disabled  = false;
   const wr = _vmc2TWins + _vmc2TLosses > 0 ? Math.round(_vmc2TWins/(_vmc2TWins+_vmc2TLosses)*100) : 0;
   _vmc2TSetStatus(`${reason} | WR ${wr}% (${_vmc2TWins}W/${_vmc2TLosses}L) | 💰 $${_vmc2TWallet.toFixed(2)}`, _vmc2TPnl >= 0 ? 'var(--green)' : 'var(--red)');
+  // ── Refresh Trades Drawer if open ──
+  if (document.getElementById('tradesDrawer')?.classList.contains('open')) _tdsRender();
 }
 // ═════════════════════════════════════════════════════════════════════════
 
@@ -18827,7 +19017,10 @@ async function _vmc2TAutoCheck() {
   const d = _vmc2Data;
   const N = d.buySignal.length;
   if (N < 3) return;
-  const si = N - 2; // dernière bougie fermée
+  // N-2 = dernière bougie fermée (signal fiable)
+  // N-1 = bougie courante : utilisée UNIQUEMENT pour Tout cross (signal instantané)
+  const si    = N - 2;
+  const siCur = N - 1;
   if (si <= _vmc2TLastSigBar) return;
 
   // ── Lire les checkboxes Pine Script ──
@@ -18842,22 +19035,41 @@ async function _vmc2TAutoCheck() {
   const useExitSig  = chk('vmc2T-as-exitSig');   // exit on opposite signal
 
   // ── Calcul des signaux selon Pine Script VMC Cipher B ──
-  const isBuy  = (useBuyMain  && d.buySignal[si])                          // wtCross && wtCrossUp && wtOversold
-              || (useBuyGold  && d.wtGoldBuy[si])                          // gold divergence
-              || (useBuyDiv   && d.buySignalDiv[si])                       // WT/RSI/Stoch bull div
-              || (useBuyDot   && d.wtCross[si] && d.wtCrossUp[si]);        // any WT cross up
+  // Signaux fiables : bougie N-2 (fermée) uniquement
+  // Tout cross : évalué aussi sur N-1 (barre courante) car le cross peut n'exister qu'un instant
+  const isBuy  = (useBuyMain  && d.buySignal[si])
+              || (useBuyGold  && d.wtGoldBuy[si])
+              || (useBuyDiv   && d.buySignalDiv[si])
+              || (useBuyDot   && (  (d.wtCross[si]    && d.wtCrossUp[si])
+                                 || (d.wtCross[siCur] && d.wtCrossUp[siCur])));
 
-  const isSell = (useSellMain && d.sellSignal[si])                         // wtCross && wtCrossDown && wtOverbought
-              || (useSellDiv  && d.sellSignalDiv[si])                      // WT/RSI/Stoch bear div
-              || (useSellDot  && d.wtCross[si] && d.wtCrossDown[si]);      // any WT cross down
+  const isSell = (useSellMain && d.sellSignal[si])
+              || (useSellDiv  && d.sellSignalDiv[si])
+              || (useSellDot  && (  (d.wtCross[si]    && d.wtCrossDown[si])
+                                 || (d.wtCross[siCur] && d.wtCrossDown[siCur])));
 
-  // ── Exit sur signal opposé si en trade ──
+  // ── Retournement auto : ferme le trade ET ouvre dans le sens opposé ──
   if (_vmc2TInTrade && useExitSig) {
-    if (_vmc2TDir === 'LONG'  && isSell) { _vmc2TLastSigBar = si; await _vmc2TClose('↺ Signal SELL'); return; }
-    if (_vmc2TDir === 'SHORT' && isBuy)  { _vmc2TLastSigBar = si; await _vmc2TClose('↺ Signal BUY');  return; }
+    if (_vmc2TDir === 'LONG'  && isSell) { _vmc2TLastSigBar = si; await _vmc2TClose('↺ Retournement SHORT'); }
+    else if (_vmc2TDir === 'SHORT' && isBuy)  { _vmc2TLastSigBar = si; await _vmc2TClose('↺ Retournement LONG'); }
+    // fall-through → ouverture du trade dans le sens opposé ci-dessous
   }
 
-  if (!isBuy && !isSell) { _vmc2TLastSigBar = si; return; } // marque la barre vérifiée
+  if (!isBuy && !isSell) {
+    // Aucun signal sur cette barre — afficher le statut de scan
+    if (!_vmc2TInTrade) {
+      const wt    = d.wt1[si];
+      const cross = d.wtCross[si];
+      const zone  = wt >  53 ? '🔴 Overbought' : wt < -53 ? '🟢 Oversold' : `WT ${wt.toFixed(1)}`;
+      const xing  = cross ? ' · ⚡ Cross!' : '';
+      const wr    = _vmc2TWins + _vmc2TLosses > 0 ? Math.round(_vmc2TWins/(_vmc2TWins+_vmc2TLosses)*100) : 0;
+      _vmc2TSetStatus(
+        `🔍 Scanning ${zone}${xing} | WR ${wr}% (${_vmc2TWins}W/${_vmc2TLosses}L) | 💰 $${_vmc2TWallet.toFixed(2)}`,
+        wt > 0 ? 'rgba(255,107,107,.7)' : 'rgba(0,200,100,.7)'
+      );
+    }
+    return; // pas de signal — réévaluer au prochain compute
+  }
   const sigDir = isBuy ? 'LONG' : 'SHORT';
   if (_vmc2TInTrade && _vmc2TDir === sigDir) { _vmc2TLastSigBar = si; return; }
 
@@ -19015,8 +19227,20 @@ function _tdsRenderHistory() {
     return;
   }
 
-  // most-recent first
-  const rows = [...trades].reverse().map(t => {
+  // ── Durée ms → "2h 34m 12s" ──
+  function _fmtDur(ms) {
+    if (!ms || ms < 0) return '—';
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sc = s % 60;
+    if (h > 0)  return `${h}h ${m}m`;
+    if (m > 0)  return `${m}m ${sc}s`;
+    return `${sc}s`;
+  }
+
+  // most-recent first (tradeHistory is already unshift → index 0 = latest)
+  const rows = trades.map(t => {
     const isL  = t.direction === 'LONG';
     const col  = isL ? 'var(--green)' : 'var(--red)';
     const pnl  = typeof t.pnl === 'number' ? t.pnl : 0;
@@ -19024,18 +19248,19 @@ function _tdsRenderHistory() {
     const sign = pnl >= 0 ? '+' : '';
     const res  = pnl >= 0 ? '<span class="tw">WIN</span>' : '<span class="tl">LOSS</span>';
     const sym  = t.sym || '';
-    const dur  = t.duration || '—';
+    const dur  = _fmtDur(t.duration);
     const exit = t.exit != null ? fmtPrice(t.exit) : '—';
     const dt   = (t.date ? t.date + ' ' : '') + (t.time || '');
     const tag  = t.real ? '<span style="color:#ff2d55;font-size:9px">●REAL</span>' : '<span style="color:#64d2ff;font-size:9px">●PAP</span>';
+    const lev  = t.lev && t.lev > 1 ? `<span style="color:#b47cff;font-size:9px">×${t.lev}</span>` : '';
 
-    return `<div class="tdr-row" title="Durée: ${dur}">
+    return `<div class="tdr-row" title="${sym} | Durée: ${dur} | ${t.reason || ''}">
       <span style="color:var(--muted2);font-size:10px">${dt}</span>
-      <span style="color:${col};font-weight:700">${isL ? '▲' : '▼'} ${tag}</span>
+      <span style="color:${col};font-weight:700">${isL ? '▲' : '▼'} ${tag} ${lev}</span>
       <span style="color:var(--accent)">${fmtPrice(t.entry)}</span>
       <span style="color:var(--muted)">${exit}</span>
       <span style="color:${pnlC};font-weight:600">${sign}$${pnl.toFixed(2)}</span>
-      <span>${res}</span>
+      <span style="display:flex;flex-direction:column;align-items:flex-end;gap:1px">${res}<span style="color:var(--muted2);font-size:9px">${dur}</span></span>
     </div>`;
   }).join('');
 
@@ -19403,7 +19628,7 @@ function _tdsExportCSV() {
     <!-- Token -->
     <label style="font-size:10px;color:var(--muted2);display:flex;align-items:center;gap:4px;flex-shrink:0">
       Token
-      <select id="vmc2-coin"
+      <select id="vmc2-coin" onchange="_vmc2SavePrefs();_vmc2Run()"
         style="width:88px;background:rgba(5,15,26,.8);color:var(--accent);border:1px solid var(--border2);
         border-radius:2px;padding:2px 6px;font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:700;outline:none;cursor:pointer">
         <option value="BTC">BTC</option>
@@ -19415,13 +19640,15 @@ function _tdsExportCSV() {
     <!-- Timeframe -->
     <label style="font-size:10px;color:var(--muted2);display:flex;align-items:center;gap:4px;flex-shrink:0">
       TF
-      <select id="vmc2-tf" style="background:rgba(5,15,26,.8);color:var(--accent);border:1px solid var(--border2);
+      <select id="vmc2-tf" onchange="_vmc2SavePrefs();_vmc2Run()"
+        style="background:rgba(5,15,26,.8);color:var(--accent);border:1px solid var(--border2);
         border-radius:2px;padding:2px 6px;font-family:'IBM Plex Mono',monospace;font-size:11px;outline:none">
         <option value="1s">1s ⚡</option><option value="10s">10s ⚡</option>
-        <option value="1m">1m</option><option value="5m">5m</option>
+        <option value="1m">1m</option><option value="3m">3m</option><option value="5m">5m</option>
         <option value="15m">15m</option><option value="30m">30m</option>
-        <option value="1h">1h</option><option value="4h" selected>4h</option>
-        <option value="1d">1d</option>
+        <option value="1h">1h</option><option value="2h">2h</option><option value="4h">4h</option>
+        <option value="6h">6h</option><option value="8h">8h</option><option value="12h">12h</option>
+        <option value="1d">1d</option><option value="3d">3d</option><option value="1w">1w</option>
       </select>
     </label>
 
@@ -19434,6 +19661,9 @@ function _tdsExportCSV() {
     <label style="font-size:10px;color:var(--muted2);display:flex;align-items:center;gap:5px;cursor:pointer;flex-shrink:0">
       <input type="checkbox" id="vmc2-auto" checked style="accent-color:#b47cff"/> Auto 60s
     </label>
+    <button onclick="toggleTradesDrawer()" style="font-size:11px;font-weight:700;padding:4px 12px;border-radius:3px;
+      border:1px solid rgba(180,124,255,.4);background:rgba(180,124,255,.08);color:#b47cff;
+      cursor:pointer;font-family:'IBM Plex Mono',monospace;letter-spacing:.06em;flex-shrink:0">📋 TRADES</button>
 
     <!-- Legend -->
     <div style="display:flex;align-items:center;gap:10px;margin-left:auto;flex-shrink:0">
@@ -19481,6 +19711,12 @@ function _tdsExportCSV() {
         <input id="vmc2T-tp" type="number" value="3" min="0.1" max="50" step="0.1"
           style="width:50px;background:var(--bg2);color:var(--text);border:1px solid rgba(0,230,118,.4);border-radius:3px;padding:3px 6px;font-family:'IBM Plex Mono',monospace;font-size:12px;outline:none"
           oninput="_vmc2TRefreshTpPreview()"/>
+      </label>
+
+      <label style="font-size:12px;color:#e2a400;display:flex;align-items:center;gap:4px;flex-shrink:0;font-weight:700"
+        title="Trailing Stop : suit le prix à X% du plus haut (LONG) / plus bas (SHORT). 0 = désactivé">Trail%
+        <input id="vmc2T-trail" type="number" value="0" min="0" max="10" step="0.1"
+          style="width:44px;background:var(--bg2);color:var(--text);border:1px solid rgba(226,164,0,.4);border-radius:3px;padding:3px 6px;font-family:'IBM Plex Mono',monospace;font-size:12px;outline:none"/>
       </label>
 
       <div style="width:1px;height:18px;background:rgba(100,210,255,.2);flex-shrink:0"></div>
@@ -19548,7 +19784,7 @@ function _tdsExportCSV() {
           <input type="checkbox" id="vmc2T-as-sellDot" style="accent-color:#ff2d55;width:13px;height:13px"> · Tout cross↓</label>
         <div style="width:1px;height:16px;background:rgba(100,210,255,.2);flex-shrink:0"></div>
         <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:#b47cff">
-          <input type="checkbox" id="vmc2T-as-exitSig" checked style="accent-color:#b47cff;width:13px;height:13px"> 🔄 Exit signal opposé</label>
+          <input type="checkbox" id="vmc2T-as-exitSig" checked style="accent-color:#b47cff;width:13px;height:13px"> 🔄 Retournement auto</label>
       </div>
 
       <!-- Position active (quand en trade) -->
@@ -19562,6 +19798,8 @@ function _tdsExportCSV() {
         <span id="vmc2T-posTp"   style="font-size:14px;color:#00e676;font-weight:700">—</span>
         <span style="font-size:12px;color:var(--muted2)">P&L</span>
         <span id="vmc2T-posPnl"  style="font-size:16px;font-weight:900">$0.00</span>
+        <span id="vmc2T-chrono"  style="font-size:13px;font-weight:700;color:#b47cff;
+          font-variant-numeric:tabular-nums;letter-spacing:.05em;min-width:52px">⏱ 00:00</span>
         <button onclick="_vmc2TClose()"
           style="font-size:12px;font-weight:700;padding:4px 14px;border-radius:4px;
           border:1px solid rgba(255,45,85,.5);background:rgba(255,45,85,.1);
