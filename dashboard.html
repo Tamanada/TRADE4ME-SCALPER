@@ -18727,6 +18727,42 @@ function _vmc2_doDrawOverlay() {
   if (cv.height !== H) cv.height = H;
   const ctx = cv.getContext('2d');
   ctx.clearRect(0, 0, W, H);
+
+  // ── Lignes verticales pointillées : historique des trades VMC2 ──────────
+  // Trait vert/rouge à l'ENTRÉE, trait blanc-cassé à la SORTIE, sur toutes
+  // les bouigies visibles dans la fenêtre actuelle.
+  const ts = _vmc2LwcChart?.timeScale();
+  if (ts && typeof tradeHistory !== 'undefined') {
+    const rp = Math.max(76, _vmc2RightPad() || 76);
+    const vmc2Trades = tradeHistory.filter(t => t.src === 'vmc2' && t.entryTs);
+    for (const t of vmc2Trades) {
+      const entryColor = t.direction === 'LONG' ? 'rgba(0,230,118,.55)' : 'rgba(255,45,85,.55)';
+      const exitColor  = t.pnl >= 0 ? 'rgba(0,230,118,.35)' : 'rgba(255,45,85,.35)';
+      // Entrée
+      const xEntry = ts.timeToCoordinate(_lwcT(t.entryTs));
+      if (xEntry !== null && xEntry > 0 && xEntry < W - rp) {
+        ctx.save();
+        ctx.strokeStyle = entryColor;
+        ctx.lineWidth   = 1.5;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath(); ctx.moveTo(xEntry, 0); ctx.lineTo(xEntry, H); ctx.stroke();
+        ctx.restore();
+      }
+      // Sortie
+      if (t.exitTs) {
+        const xExit = ts.timeToCoordinate(_lwcT(t.exitTs));
+        if (xExit !== null && xExit > 0 && xExit < W - rp) {
+          ctx.save();
+          ctx.strokeStyle = exitColor;
+          ctx.lineWidth   = 1.5;
+          ctx.setLineDash([2, 5]);
+          ctx.beginPath(); ctx.moveTo(xExit, 0); ctx.lineTo(xExit, H); ctx.stroke();
+          ctx.restore();
+        }
+      }
+    }
+  }
+
   if (!_vmc2TInTrade) return;
 
   const rp    = Math.max(76, _vmc2RightPad() || 76) + 2; // stop well before price-axis
@@ -19036,6 +19072,8 @@ async function _vmc2TClose(reason = 'Manual') {
       reason,
       real:      !paper,
       src:       'vmc2',   // source tag
+      entryTs:   openTime, // timestamp ms entrée — pour lignes verticales sur le chart
+      exitTs:    Date.now(), // timestamp ms sortie
     });
     try { localStorage.setItem('trade_history', JSON.stringify(tradeHistory.slice(0, 200))); } catch(e) {}
     // ── Compound capital: add net P&L to wallet ──
