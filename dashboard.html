@@ -18606,7 +18606,7 @@ function _vmc2TSetStatus(msg, col = 'var(--muted2)') {
 // ── Mode MANUEL / AUTO VMC ────────────────────────────────────────────────
 function _vmc2TSetMode(mode) {
   _vmc2TAutoOn = (mode === 'auto');
-  if (mode === 'auto') _vmc2TLastSigBar = -1; // reset so signals fire immediately
+  if (mode === 'auto') { _vmc2TLastSigBar = -1; _vmc2TLastRetBar = -1; } // reset so signals fire immediately
   const mBtn    = document.getElementById('vmc2T-modeManuel');
   const aBtn    = document.getElementById('vmc2T-modeAuto');
   const longBtn = document.getElementById('vmc2T-longBtn');
@@ -18622,6 +18622,7 @@ function _vmc2TSetMode(mode) {
     if (preview)  preview.style.display  = 'none';
     if (autoSet)  autoSet.style.display  = 'flex';
     _vmc2TLastSigBar = -1;
+    _vmc2TLastRetBar = -1;
     _vmc2TSetStatus('🤖 AUTO VMC actif — surveille les signaux Pine Script', '#b47cff');
   } else {
     if (mBtn)    { mBtn.style.background = 'rgba(100,210,255,.15)'; mBtn.style.color = 'var(--accent)'; }
@@ -19007,7 +19008,8 @@ async function _vmc2TClose(reason = 'Manual') {
 // ── VMC2 Auto-trade ──────────────────────────────────────────────────────
 let _vmc2TAutoOn       = false;
 let _vmc2TAutoLock     = false;  // prevent concurrent entries
-let _vmc2TLastSigBar   = -1;     // bar index of last acted signal
+let _vmc2TLastSigBar   = -1;     // guard ENTRÉES : index de la dernière barre traitée
+let _vmc2TLastRetBar   = -1;     // guard RETOURNEMENT : séparé de _vmc2TLastSigBar
 
 // Legacy alias — kept in case other code calls it
 function _vmc2TToggleAuto() {
@@ -19020,26 +19022,23 @@ async function _vmc2TAutoCheck() {
   const d = _vmc2Data;
   const N = d.buySignal.length;
   if (N < 3) return;
-  // N-2 = dernière bougie fermée (signal fiable)
-  // N-1 = bougie courante : utilisée UNIQUEMENT pour Tout cross (signal instantané)
+  // N-2 = dernière bougie fermée (signal fiable pour les entrées)
+  // N-1 = bougie courante (incluse pour les sorties/retournements — réactivité maximale)
   const si    = N - 2;
   const siCur = N - 1;
-  if (si <= _vmc2TLastSigBar) return;
 
   // ── Lire les checkboxes Pine Script ──
   const chk = id => document.getElementById(id)?.checked !== false;
-  const useBuyMain  = chk('vmc2T-as-buyMain');   // 🟢 BUY circle
-  const useBuyGold  = chk('vmc2T-as-buyGold');   // 🟡 GOLD
-  const useBuyDiv   = document.getElementById('vmc2T-as-buyDiv')?.checked;   // 📈 Div+
-  const useBuyDot   = document.getElementById('vmc2T-as-buyDot')?.checked;   // · any cross↑
-  const useSellMain = chk('vmc2T-as-sellMain');  // 🔴 SELL circle
-  const useSellDiv  = document.getElementById('vmc2T-as-sellDiv')?.checked;  // 📉 Div-
-  const useSellDot  = document.getElementById('vmc2T-as-sellDot')?.checked;  // · any cross↓
-  const useExitSig  = chk('vmc2T-as-exitSig');   // exit on opposite signal
+  const useBuyMain  = chk('vmc2T-as-buyMain');
+  const useBuyGold  = chk('vmc2T-as-buyGold');
+  const useBuyDiv   = document.getElementById('vmc2T-as-buyDiv')?.checked;
+  const useBuyDot   = document.getElementById('vmc2T-as-buyDot')?.checked;
+  const useSellMain = chk('vmc2T-as-sellMain');
+  const useSellDiv  = document.getElementById('vmc2T-as-sellDiv')?.checked;
+  const useSellDot  = document.getElementById('vmc2T-as-sellDot')?.checked;
+  const useExitSig  = chk('vmc2T-as-exitSig');
 
-  // ── Calcul des signaux selon Pine Script VMC Cipher B ──
-  // Signaux fiables : bougie N-2 (fermée) uniquement
-  // Tout cross : évalué aussi sur N-1 (barre courante) car le cross peut n'exister qu'un instant
+  // ── Signaux N-2 (barre fermée) — utilisés pour les ENTRÉES ──
   const isBuy  = (useBuyMain  && d.buySignal[si])
               || (useBuyGold  && d.wtGoldBuy[si])
               || (useBuyDiv   && d.buySignalDiv[si])
@@ -19051,16 +19050,41 @@ async function _vmc2TAutoCheck() {
               || (useSellDot  && (  (d.wtCross[si]    && d.wtCrossDown[si])
                                  || (d.wtCross[siCur] && d.wtCrossDown[siCur])));
 
-  // ── Retournement auto : ferme le trade ET ouvre dans le sens opposé ──
-  // Guard si > _vmc2TLastSigBar évite la cascade (même barre re-déclenche retournement)
-  if (_vmc2TInTrade && useExitSig && si > _vmc2TLastSigBar) {
-    if (_vmc2TDir === 'LONG'  && isSell) { _vmc2TLastSigBar = si; await _vmc2TClose('↺ Retournement SHORT'); }
-    else if (_vmc2TDir === 'SHORT' && isBuy)  { _vmc2TLastSigBar = si; await _vmc2TClose('↺ Retournement LONG'); }
-    // fall-through → ouverture du trade dans le sens opposé ci-dessous
+  // ── RETOURNEMENT AUTO ─────────────────────────────────────────────────────
+  // Vérifié AVANT le guard d'entrée (si <= _vmc2TLastSigBar) pour ne jamais rater un exit.
+  // Guard séparé _vmc2TLastRetBar évite la cascade sans bloquer les nouvelles entrées.
+  // Inclut N-1 (bougie courante) pour réagir sans attendre la fermeture de barre.
+  let justRetourned = false;
+  if (_vmc2TInTrade && useExitSig && si > _vmc2TLastRetBar) {
+    const sellRet = isSell
+                 || (useSellMain && d.sellSignal[siCur])
+                 || (useSellDiv  && d.sellSignalDiv[siCur])
+                 || (useSellDot  && d.wtCross[siCur] && d.wtCrossDown[siCur]);
+    const buyRet  = isBuy
+                 || (useBuyMain  && d.buySignal[siCur])
+                 || (useBuyGold  && d.wtGoldBuy[siCur])
+                 || (useBuyDiv   && d.buySignalDiv[siCur])
+                 || (useBuyDot   && d.wtCross[siCur] && d.wtCrossUp[siCur]);
+
+    if (_vmc2TDir === 'LONG'  && sellRet) {
+      _vmc2TLastRetBar = si;
+      _vmc2TLastSigBar = si;
+      await _vmc2TClose('↺ Retournement SHORT');
+      justRetourned = true;
+    } else if (_vmc2TDir === 'SHORT' && buyRet) {
+      _vmc2TLastRetBar = si;
+      _vmc2TLastSigBar = si;
+      await _vmc2TClose('↺ Retournement LONG');
+      justRetourned = true;
+    }
   }
 
+  // ── Guard ENTRÉE : ne traiter N-2 qu'une seule fois ───────────────────────
+  // Bypassed si retournement vient de s'exécuter → permet d'ouvrir dans le sens opposé
+  if (!justRetourned && si <= _vmc2TLastSigBar) return;
+
   if (!isBuy && !isSell) {
-    // Aucun signal sur cette barre — afficher le statut de scan
+    // Aucun signal N-2 → statut de scan (seulement si pas de trade ouvert)
     if (!_vmc2TInTrade) {
       const wt    = d.wt1[si];
       const cross = d.wtCross[si];
@@ -19072,7 +19096,7 @@ async function _vmc2TAutoCheck() {
         wt > 0 ? 'rgba(255,107,107,.7)' : 'rgba(0,200,100,.7)'
       );
     }
-    return; // pas de signal — réévaluer au prochain compute
+    return;
   }
   const sigDir = isBuy ? 'LONG' : 'SHORT';
   if (_vmc2TInTrade && _vmc2TDir === sigDir) { _vmc2TLastSigBar = si; return; }
@@ -19084,6 +19108,7 @@ async function _vmc2TAutoCheck() {
 
   _vmc2TAutoLock = true;
   _vmc2TLastSigBar = si;
+  _vmc2TLastRetBar = si;  // empêche le retournement immédiat sur la barre d'entrée
   try {
     if (_vmc2TInTrade && _vmc2TDir !== sigDir) {
       await _vmc2TClose('↺ Signal opposé');
