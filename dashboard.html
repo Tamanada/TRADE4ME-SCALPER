@@ -19057,6 +19057,8 @@ async function _vmc2TTrade(dir) {
     document.getElementById('vmc2T-shortBtn').disabled    = true;
     const dirEl = document.getElementById('vmc2T-posDir');
     if (dirEl) { dirEl.textContent = dir; dirEl.style.color = dir === 'LONG' ? 'var(--green)' : 'var(--red)'; }
+    const tfEl = document.getElementById('vmc2T-posTf');
+    if (tfEl) tfEl.textContent = `${coin} ${_vmc2GetTF()}`;
     document.getElementById('vmc2T-posEntry').textContent = fmtPrice(entry);
     document.getElementById('vmc2T-posSl').textContent    = sl > 0 ? fmtPrice(sl) : '—';
     document.getElementById('vmc2T-posTp').textContent    = tp > 0 ? fmtPrice(tp) : '—';
@@ -20011,6 +20013,7 @@ function _tdsExportCSV() {
       <!-- Position active (quand en trade) -->
       <div id="vmc2T-pos" style="display:none;align-items:center;gap:12px;flex-wrap:wrap">
         <span id="vmc2T-posDir"   style="font-size:15px;font-weight:900;letter-spacing:.07em">—</span>
+        <span id="vmc2T-posTf"   style="font-size:11px;font-weight:700;color:var(--accent);background:rgba(100,210,255,.1);border:1px solid rgba(100,210,255,.25);border-radius:3px;padding:1px 6px;letter-spacing:.06em">—</span>
         <span style="font-size:12px;color:var(--muted2)">@</span>
         <span id="vmc2T-posEntry" style="font-size:14px;color:var(--text);font-weight:700">—</span>
         <span style="font-size:12px;color:var(--muted2)">SL</span>
