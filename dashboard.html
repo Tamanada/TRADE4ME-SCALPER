@@ -18647,7 +18647,7 @@ function _vmc2TSetStatus(msg, col = 'var(--muted2)') {
 // ── Mode MANUEL / AUTO VMC ────────────────────────────────────────────────
 function _vmc2TSetMode(mode) {
   _vmc2TAutoOn = (mode === 'auto');
-  if (mode === 'auto') { _vmc2TLastSigBar = -1; _vmc2TLastRetBar = -1; } // reset so signals fire immediately
+  if (mode === 'auto') { _vmc2TLastSigBar = -1; _vmc2TLastRetBar = -1; _vmc2TLastSigTime = -1; _vmc2TLastRetTime = -1; } // reset
   const mBtn    = document.getElementById('vmc2T-modeManuel');
   const aBtn    = document.getElementById('vmc2T-modeAuto');
   const longBtn = document.getElementById('vmc2T-longBtn');
@@ -18662,8 +18662,8 @@ function _vmc2TSetMode(mode) {
     if (shortBtn) shortBtn.style.display = 'none';
     if (preview)  preview.style.display  = 'none';
     if (autoSet)  autoSet.style.display  = 'flex';
-    _vmc2TLastSigBar = -1;
-    _vmc2TLastRetBar = -1;
+    _vmc2TLastSigBar = -1; _vmc2TLastRetBar = -1;
+    _vmc2TLastSigTime = -1; _vmc2TLastRetTime = -1;
     _vmc2TSetStatus('🤖 AUTO VMC actif — surveille les signaux Pine Script', '#b47cff');
   } else {
     if (mBtn)    { mBtn.style.background = 'rgba(100,210,255,.15)'; mBtn.style.color = 'var(--accent)'; }
@@ -19048,9 +19048,16 @@ async function _vmc2TClose(reason = 'Manual') {
 
 // ── VMC2 Auto-trade ──────────────────────────────────────────────────────
 let _vmc2TAutoOn       = false;
-let _vmc2TAutoLock     = false;  // prevent concurrent entries
-let _vmc2TLastSigBar   = -1;     // guard ENTRÉES : index de la dernière barre traitée
-let _vmc2TLastRetBar   = -1;     // guard RETOURNEMENT : séparé de _vmc2TLastSigBar
+let _vmc2TAutoLock     = false;   // prevent concurrent entries
+// ⚠ Les guards utilisent des TIMESTAMPS (ms) et non des indices de tableau.
+//   Le tableau de bougies a une taille fixe (600) — quand une nouvelle bougie arrive,
+//   l'ancienne est décalée (shift). L'index N-2 reste donc toujours le même (599).
+//   Seul le timestamp de la bougie N-2 avance réellement dans le temps.
+let _vmc2TLastSigTime  = -1;     // guard ENTRÉES  : timestamp ms de la dernière barre traitée
+let _vmc2TLastRetTime  = -1;     // guard RETOURNEMENT : séparé de _vmc2TLastSigTime
+// Alias legacy (non utilisés pour la logique — conservés pour compatibilité)
+let _vmc2TLastSigBar   = -1;
+let _vmc2TLastRetBar   = -1;
 
 // Legacy alias — kept in case other code calls it
 function _vmc2TToggleAuto() {
@@ -19067,6 +19074,11 @@ async function _vmc2TAutoCheck() {
   // N-1 = bougie courante (incluse pour les sorties/retournements — réactivité maximale)
   const si    = N - 2;
   const siCur = N - 1;
+
+  // ⚠ GUARD PAR TIMESTAMP — le tableau a taille fixe (600 bars + 1 courant = 601).
+  //   L'index N-2 est TOUJOURS identique (599). Seul le timestamp de la bougie N-2
+  //   avance réellement (ex: +10s à chaque barre sur TF 10s, +4h sur TF 4h).
+  const siT = d.candles[si].t;   // timestamp ms de la bougie N-2
 
   // ── Lire les checkboxes Pine Script ──
   const chk = id => document.getElementById(id)?.checked !== false;
@@ -19092,11 +19104,10 @@ async function _vmc2TAutoCheck() {
                                  || (d.wtCross[siCur] && d.wtCrossDown[siCur])));
 
   // ── RETOURNEMENT AUTO ─────────────────────────────────────────────────────
-  // Vérifié AVANT le guard d'entrée (si <= _vmc2TLastSigBar) pour ne jamais rater un exit.
-  // Guard séparé _vmc2TLastRetBar évite la cascade sans bloquer les nouvelles entrées.
-  // Inclut N-1 (bougie courante) pour réagir sans attendre la fermeture de barre.
+  // Guard par TIMESTAMP (siT > _vmc2TLastRetTime) — correct même avec tableau circulaire.
+  // _vmc2TAutoLock = true avant l'await pour éviter les appels concurrents pendant le fetch.
   let justRetourned = false;
-  if (_vmc2TInTrade && useExitSig && si > _vmc2TLastRetBar) {
+  if (_vmc2TInTrade && useExitSig && siT > _vmc2TLastRetTime) {
     const sellRet = isSell
                  || (useSellMain && d.sellSignal[siCur])
                  || (useSellDiv  && d.sellSignalDiv[siCur])
@@ -19108,24 +19119,24 @@ async function _vmc2TAutoCheck() {
                  || (useBuyDot   && d.wtCross[siCur] && d.wtCrossUp[siCur]);
 
     if (_vmc2TDir === 'LONG'  && sellRet) {
-      _vmc2TLastRetBar = si;
-      _vmc2TLastSigBar = si;
-      await _vmc2TClose('↺ Retournement SHORT');
+      _vmc2TLastRetTime = siT;
+      _vmc2TLastSigTime = siT;
+      _vmc2TAutoLock = true;
+      try { await _vmc2TClose('↺ Retournement SHORT'); } finally { _vmc2TAutoLock = false; }
       justRetourned = true;
     } else if (_vmc2TDir === 'SHORT' && buyRet) {
-      _vmc2TLastRetBar = si;
-      _vmc2TLastSigBar = si;
-      await _vmc2TClose('↺ Retournement LONG');
+      _vmc2TLastRetTime = siT;
+      _vmc2TLastSigTime = siT;
+      _vmc2TAutoLock = true;
+      try { await _vmc2TClose('↺ Retournement LONG'); } finally { _vmc2TAutoLock = false; }
       justRetourned = true;
     }
   }
 
-  // ── Guard ENTRÉE : ne traiter N-2 qu'une seule fois ───────────────────────
-  // Bypassed si retournement vient de s'exécuter → permet d'ouvrir dans le sens opposé
-  if (!justRetourned && si <= _vmc2TLastSigBar) return;
+  // ── Guard ENTRÉE par TIMESTAMP : ne traiter la bougie N-2 qu'une seule fois ──
+  if (!justRetourned && siT <= _vmc2TLastSigTime) return;
 
   if (!isBuy && !isSell) {
-    // Aucun signal N-2 → statut de scan (seulement si pas de trade ouvert)
     if (!_vmc2TInTrade) {
       const wt    = d.wt1[si];
       const cross = d.wtCross[si];
@@ -19140,7 +19151,7 @@ async function _vmc2TAutoCheck() {
     return;
   }
   const sigDir = isBuy ? 'LONG' : 'SHORT';
-  if (_vmc2TInTrade && _vmc2TDir === sigDir) { _vmc2TLastSigBar = si; return; }
+  if (_vmc2TInTrade && _vmc2TDir === sigDir) { _vmc2TLastSigTime = siT; return; }
 
   // ── Label du signal pour le log ──
   const sigLabel = isBuy
@@ -19148,8 +19159,8 @@ async function _vmc2TAutoCheck() {
     : (d.sellSignalDiv[si] ? '📉 Div-' : d.wtCross[si] && !d.sellSignal[si] ? '· cross↓' : '🔴 SELL');
 
   _vmc2TAutoLock = true;
-  _vmc2TLastSigBar = si;
-  _vmc2TLastRetBar = si;  // empêche le retournement immédiat sur la barre d'entrée
+  _vmc2TLastSigTime = siT;
+  _vmc2TLastRetTime = siT;  // empêche retournement immédiat sur la barre d'entrée
   try {
     if (_vmc2TInTrade && _vmc2TDir !== sigDir) {
       await _vmc2TClose('↺ Signal opposé');
