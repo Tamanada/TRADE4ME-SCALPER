@@ -18703,7 +18703,13 @@ function _vmc2RefreshMarkers() {
 function _vmc2RebuildMarkers() {
   _vmc2AllMarkers = [];
   if (typeof tradeHistory === 'undefined') return;
-  const vmc2 = tradeHistory.filter(t => t.src === 'vmc2' && t.entryTs).slice(0, 50);
+  const currentSym = _vmc2GetCoin().toUpperCase() + 'USDT';
+  const currentTf  = _vmc2GetTF();
+  // Filtrer par token ET timeframe — évite d'afficher les trades SUI sur BTC etc.
+  const vmc2 = tradeHistory.filter(t =>
+    t.src === 'vmc2' && t.entryTs &&
+    t.sym === currentSym && t.tf === currentTf
+  ).slice(0, 50);
   for (const t of vmc2) {
     const isLong = t.direction === 'LONG';
     _vmc2AllMarkers.push({
@@ -19126,6 +19132,7 @@ async function _vmc2TClose(reason = 'Manual') {
       reason,
       real:      !paper,
       src:       'vmc2',   // source tag
+      tf:        _vmc2GetTF(), // timeframe — pour filtrer les marqueurs par chart
       entryTs:   openTime, // timestamp ms entrée — pour lignes verticales sur le chart
       exitTs:    Date.now(), // timestamp ms sortie
     });
