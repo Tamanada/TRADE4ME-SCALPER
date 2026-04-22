@@ -17773,23 +17773,25 @@ function _v2Fractal(data) {
 
 // ── Divergence detection ──
 function _v2FindDivs(src, fractals, high, low, topLimit, botLimit, useLimits) {
-  const bearDiv = new Array(src.length).fill(false);
-  const bullDiv = new Array(src.length).fill(false);
+  const bearDiv     = new Array(src.length).fill(false);
+  const bullDiv     = new Array(src.length).fill(false);
+  const bearDivFrom = new Array(src.length).fill(-1);  // index du fractal précédent (pour tracer la ligne)
+  const bullDivFrom = new Array(src.length).fill(-1);
   let ltI=-1,ltS=0,ltH=0, ptI=-1,ptS=0,ptH=0;
   let lbI=-1,lbS=0,lbL=0, pbI=-1,pbS=0,pbL=0;
   for (let i = 0; i < src.length; i++) {
     if (fractals[i] === 1 && (!useLimits || src[i] >= topLimit)) {
       ptI=ltI; ptS=ltS; ptH=ltH;
       ltI=i; ltS=src[i]; ltH=high[i];
-      if (ptI >= 0 && high[i] > ptH && src[i] < ptS) bearDiv[i] = true;
+      if (ptI >= 0 && high[i] > ptH && src[i] < ptS) { bearDiv[i] = true; bearDivFrom[i] = ptI; }
     }
     if (fractals[i] === -1 && (!useLimits || src[i] <= botLimit)) {
       pbI=lbI; pbS=lbS; pbL=lbL;
       lbI=i; lbS=src[i]; lbL=low[i];
-      if (pbI >= 0 && low[i] < pbL && src[i] > pbS) bullDiv[i] = true;
+      if (pbI >= 0 && low[i] < pbL && src[i] > pbS) { bullDiv[i] = true; bullDivFrom[i] = pbI; }
     }
   }
-  return { bearDiv, bullDiv };
+  return { bearDiv, bullDiv, bearDivFrom, bullDivFrom };
 }
 
 // ── Compute all indicators ──
@@ -17814,19 +17816,30 @@ function _v2Compute(candles) {
   const crossColor = wt1.map((v, i) => (wt2[i] - wt1[i]) > 0 ? '#ff5252' : '#00e676');
   // WT divergences
   const wt2Fr = _v2Fractal(wt2);
-  const { bearDiv: wtBearDiv, bullDiv: wtBullDiv } = _v2FindDivs(wt2, wt2Fr, high, low, 45, -65, true);
-  // Gold buy
-  let lastWtLow = -999;
+  const { bearDiv: wtBearDiv, bullDiv: wtBullDiv,
+          bearDivFrom: wtBearDivFrom, bullDivFrom: wtBullDivFrom } = _v2FindDivs(wt2, wt2Fr, high, low, 45, -65, true);
+  // Gold buy — correction du bug : utilise prevWtLow (fractal précédent) pas lastWtLow
+  // Condition originale VMC : divergence haussière + fractal PRÉCÉDENT en zone extreme OS3 (-75)
+  // On ne track que les fractals oversold (wt2 <= -65, même filtre que wtBullDiv)
+  // pour éviter que prevWtLow soit un fractal neutre (wt2 = -20 etc.)
+  const botLimitGold = -65;
+  let lastWtLow = -999, prevWtLow = -999;
   const wtGoldBuy = wt1.map((_, i) => {
-    if (wt2Fr[i] === -1) lastWtLow = wt2[i];
-    return wtBullDiv[i] && lastWtLow <= OS3 && wt2[i] > OS3 && (lastWtLow - wt2[i]) <= -5 && rsi[i] < 30;
+    if (wt2Fr[i] === -1 && wt2[i] <= botLimitGold) {
+      prevWtLow = lastWtLow;   // sauvegarde le fractal oversold précédent
+      lastWtLow = wt2[i];      // met à jour avec le fractal courant
+    }
+    // wtBullDiv[i] = vrai au fractal courant (wt2[i] > prevWtLow → divergence haussière)
+    // prevWtLow = WT2 du fractal oversold précédent → doit être <= -75 (zone extrême)
+    return wtBullDiv[i] && prevWtLow <= OS3;
   });
   // Buy+sell div signals
-  const buySignalDiv  = wtBullDiv.map((v, i) => v);
-  const sellSignalDiv = wtBearDiv.map((v, i) => v);
+  const buySignalDiv  = wtBullDiv.slice();
+  const sellSignalDiv = wtBearDiv.slice();
   return { wt1, wt2, wtVwap, rsiMFI, rsi, stochK, stochD,
            wtCross, wtCrossUp, wtCrossDown, crossColor, buySignal, sellSignal,
            wtBearDiv, wtBullDiv, wtGoldBuy,
+           wtBearDivFrom, wtBullDivFrom,
            buySignalDiv, sellSignalDiv, candles, high, low };
 }
 
@@ -17966,16 +17979,44 @@ function _v2Draw(canvas, d, logFrom, logTo, rightPad) {
   }
   ctx.globalAlpha = 1;
 
-  // ── WT divergence markers (purple) on wt2 ──
+  // ── Divergence LINES reliant les deux fractals sur wt2 ──
+  ctx.save();
+  ctx.setLineDash([5, 4]);
+  ctx.lineWidth = 1.5;
+  for (let i = drawFrom; i < drawTo; i++) {
+    if (d.wtBullDiv[i] && d.wtBullDivFrom && d.wtBullDivFrom[i] >= 0) {
+      const fromI = d.wtBullDivFrom[i];
+      if (fromI >= drawFrom) {  // les deux points visibles
+        ctx.beginPath();
+        ctx.moveTo(xc(fromI), yc(d.wt2[fromI]));
+        ctx.lineTo(xc(i),     yc(d.wt2[i]));
+        ctx.strokeStyle = 'rgba(0,230,118,.75)';
+        ctx.stroke();
+      }
+    }
+    if (d.wtBearDiv[i] && d.wtBearDivFrom && d.wtBearDivFrom[i] >= 0) {
+      const fromI = d.wtBearDivFrom[i];
+      if (fromI >= drawFrom) {
+        ctx.beginPath();
+        ctx.moveTo(xc(fromI), yc(d.wt2[fromI]));
+        ctx.lineTo(xc(i),     yc(d.wt2[i]));
+        ctx.strokeStyle = 'rgba(255,82,82,.75)';
+        ctx.stroke();
+      }
+    }
+  }
+  ctx.restore();
+
+  // ── WT divergence markers (triangles) sur wt2 ──
   const divR = Math.max(3, dotR * 1.4);
   for (let i = drawFrom; i < drawTo; i++) {
     if (d.wtBullDiv[i]) {
-      ctx.fillStyle = '#e600e6'; ctx.globalAlpha = .85;
+      ctx.fillStyle = '#00e676'; ctx.globalAlpha = .9;
       const x = xc(i), y = yc(d.wt2[i]);
       ctx.beginPath(); ctx.moveTo(x, y+divR+4); ctx.lineTo(x-divR, y+4); ctx.lineTo(x+divR, y+4); ctx.closePath(); ctx.fill();
     }
     if (d.wtBearDiv[i]) {
-      ctx.fillStyle = '#e600e6'; ctx.globalAlpha = .85;
+      ctx.fillStyle = '#ff5252'; ctx.globalAlpha = .9;
       const x = xc(i), y = yc(d.wt2[i]);
       ctx.beginPath(); ctx.moveTo(x, y-divR-4); ctx.lineTo(x-divR, y-4); ctx.lineTo(x+divR, y-4); ctx.closePath(); ctx.fill();
     }
