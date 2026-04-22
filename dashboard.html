@@ -18285,6 +18285,7 @@ function _vmc2StopTickMode() {
   if (_vmc2TickRenderTimer) { clearInterval(_vmc2TickRenderTimer); _vmc2TickRenderTimer = null; }
   _vmc2TickBars = []; _vmc2TickCur = null;
   _vmc2LwcLen = 0; _vmc2LwcLastBarT = 0;
+  _vmc2AllMarkers = [];
 }
 
 // ── Prix Binance instantané — remplace hlPrice() pour VMC2 ───────────────
@@ -18370,6 +18371,7 @@ async function _vmc2StartTickMode(coin, tf) {
     _vmc2LwcLen      = _vmc2TickBars.length;   // LWC vient de recevoir exactement ces bars
     _vmc2LwcLastBarT = _vmc2TickBars.length ? _vmc2TickBars[_vmc2TickBars.length - 1].t : 0;
     _vmc2Data = _v2Compute(_vmc2TickBars);
+    _vmc2RebuildMarkers(); // restaure les marqueurs des trades passés sur le nouveau chart
     _vmc2Render();
     _vmc2UpdateSignalBar();
     // Vérifier les signaux sur la dernière bougie fermée (avant que le WS se connecte)
@@ -18586,6 +18588,7 @@ let _vmc2TPriceLines = [];
 let _vmc2SlPriceLine = null;   // draggable SL line ref
 let _vmc2TpPriceLine = null;   // draggable TP line ref
 let _vmc2TMarkers    = [];
+let _vmc2AllMarkers  = [];  // marqueurs LWC persistants (entrées + sorties)
 let _vmc2TPnlTimer   = null;
 let _vmc2TLev        = 1;      // leverage at trade open (stored to avoid DOM re-reads)
 let _vmc2TNotional   = 100;    // size × lev at open
@@ -18687,13 +18690,52 @@ function _vmc2TSetMode(mode) {
   }
 }
 
+// ── Applique tous les marqueurs LWC persistants (entrées + sorties) ──────
+function _vmc2RefreshMarkers() {
+  if (!_vmc2CandleSer) return;
+  try {
+    const sorted = [..._vmc2AllMarkers].sort((a, b) => a.time - b.time);
+    _vmc2CandleSer.setMarkers(sorted);
+  } catch(e) {}
+}
+
+// ── Reconstruit les marqueurs depuis tradeHistory (après reload / changement TF) ──
+function _vmc2RebuildMarkers() {
+  _vmc2AllMarkers = [];
+  if (typeof tradeHistory === 'undefined') return;
+  const vmc2 = tradeHistory.filter(t => t.src === 'vmc2' && t.entryTs).slice(0, 50);
+  for (const t of vmc2) {
+    const isLong = t.direction === 'LONG';
+    _vmc2AllMarkers.push({
+      time:     _lwcT(t.entryTs),
+      position: isLong ? 'belowBar' : 'aboveBar',
+      color:    isLong ? '#00e676' : '#ff2d55',
+      shape:    isLong ? 'arrowUp' : 'arrowDown',
+      text:     `${isLong ? '▲' : '▼'} @${fmtPrice(t.entry)}`,
+      size: 1,
+    });
+    if (t.exitTs) {
+      const win = (t.pnl || 0) >= 0;
+      _vmc2AllMarkers.push({
+        time:     _lwcT(t.exitTs),
+        position: isLong ? 'aboveBar' : 'belowBar',
+        color:    win ? '#00e676' : '#ff2d55',
+        shape:    'circle',
+        text:     `${win ? '✓' : '✗'} ${win ? '+' : ''}$${(t.pnl||0).toFixed(2)}`,
+        size: 0.8,
+      });
+    }
+  }
+  _vmc2RefreshMarkers();
+}
+
 function _vmc2TClearSignals() {
   _vmc2TPriceLines.forEach(l => { try { _vmc2CandleSer.removePriceLine(l); } catch(e){} });
   _vmc2TPriceLines = [];
   _vmc2SlPriceLine = null;
   _vmc2TpPriceLine = null;
-  if (_vmc2CandleSer) { try { _vmc2CandleSer.setMarkers([]); } catch(e){} }
   _vmc2TMarkers = [];
+  _vmc2RefreshMarkers(); // restore persistent markers (ne pas effacer l'historique)
   _vmc2DrawTradeOverlay(); // clear canvas overlay (draws nothing when !_vmc2TInTrade)
 }
 
@@ -19022,6 +19064,16 @@ async function _vmc2TTrade(dir) {
     _vmc2TStartChrono();
     // Lignes pointillées : ENTRY (cyan) + SL/TP seulement en mode MANUEL
     _vmc2TDrawSignals(dir, entry, sl, tp);
+    // Marqueur LWC flèche entrée (visible live, persiste après clôture)
+    _vmc2AllMarkers.push({
+      time:     _lwcT(_vmc2TOpenTime),
+      position: dir === 'LONG' ? 'belowBar' : 'aboveBar',
+      color:    dir === 'LONG' ? '#00e676' : '#ff2d55',
+      shape:    dir === 'LONG' ? 'arrowUp' : 'arrowDown',
+      text:     `${dir === 'LONG' ? '▲' : '▼'} @${fmtPrice(entry)}`,
+      size: 1,
+    });
+    _vmc2RefreshMarkers();
     const slTpInfo = _vmc2TAutoOn
       ? '🤖 sortie sur signal'
       : `SL ${fmtPrice(sl)} | TP ${fmtPrice(tp)}`;
@@ -19076,6 +19128,18 @@ async function _vmc2TClose(reason = 'Manual') {
       exitTs:    Date.now(), // timestamp ms sortie
     });
     try { localStorage.setItem('trade_history', JSON.stringify(tradeHistory.slice(0, 200))); } catch(e) {}
+    // ── Marqueur LWC sortie (cercle vert = gain, rouge = perte) ──
+    const isLong = _vmc2TDir === 'LONG';
+    const exitTs = Date.now();
+    _vmc2AllMarkers.push({
+      time:     _lwcT(exitTs),
+      position: isLong ? 'aboveBar' : 'belowBar',
+      color:    pnl >= 0 ? '#00e676' : '#ff2d55',
+      shape:    'circle',
+      text:     `${reason} ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`,
+      size: 0.8,
+    });
+    _vmc2RefreshMarkers();
     // ── Compound capital: add net P&L to wallet ──
     _vmc2TWallet += pnl;
     const newSize = Math.max(10, _vmc2TWallet);
