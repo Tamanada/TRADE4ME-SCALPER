@@ -18125,8 +18125,12 @@ function _vmc2InitChart() {
     if (!canvas || !wrap) return;
     canvas.width  = wrap.clientWidth  || 900;
     canvas.height = wrap.clientHeight || 300;
-    // Pass raw from/to — same mapping LWC uses, including empty right slots
-    _v2Draw(canvas, _vmc2Data, range.from, range.to, _vmc2RightPad());
+    // LWC a plus de bougies que l'oscillateur (buffer circulaire ~601 max).
+    // offset = combien de bougies LWC n'existent pas dans l'oscillateur (depuis le début).
+    // Cela aligne les deux charts : oscillateur index i ↔ LWC index i + offset.
+    const N_osc  = _vmc2Data.wt1.length;
+    const offset = Math.max(0, _vmc2LwcLen - N_osc);
+    _v2Draw(canvas, _vmc2Data, range.from - offset, range.to - offset, _vmc2RightPad());
     _vmc2DrawTradeOverlay(); // keep SL/TP lines aligned on pan/zoom
   });
   // Attach drag listeners for SL/TP lines (once)
@@ -18273,11 +18277,14 @@ let _vmc2TickBars        = [];
 let _vmc2TickBucket      = 1000;
 let _vmc2TickCur         = null;
 let _vmc2TickRenderTimer = null;
+let _vmc2LwcLen          = 0;   // nb de bougies LWC (croît à chaque update() unique)
+let _vmc2LwcLastBarT     = 0;   // dernier timestamp envoyé à LWC — détecte les nouvelles barres
 
 function _vmc2StopTickMode() {
   if (_vmc2TickWs) { try { _vmc2TickWs.close(); } catch(e){} _vmc2TickWs = null; }
   if (_vmc2TickRenderTimer) { clearInterval(_vmc2TickRenderTimer); _vmc2TickRenderTimer = null; }
   _vmc2TickBars = []; _vmc2TickCur = null;
+  _vmc2LwcLen = 0; _vmc2LwcLastBarT = 0;
 }
 
 // ── Prix Binance instantané — remplace hlPrice() pour VMC2 ───────────────
@@ -18360,6 +18367,8 @@ async function _vmc2StartTickMode(coin, tf) {
     }
     _vmc2InitChart();
     _vmc2FeedChart(_vmc2TickBars);
+    _vmc2LwcLen      = _vmc2TickBars.length;   // LWC vient de recevoir exactement ces bars
+    _vmc2LwcLastBarT = _vmc2TickBars.length ? _vmc2TickBars[_vmc2TickBars.length - 1].t : 0;
     _vmc2Data = _v2Compute(_vmc2TickBars);
     _vmc2Render();
     _vmc2UpdateSignalBar();
@@ -18459,6 +18468,8 @@ async function _vmc2StartTickMode(coin, tf) {
           time: _lwcT(cur.t), value: cur.v,
           color: cur.c >= cur.o ? 'rgba(0,230,118,.3)' : 'rgba(255,45,85,.3)'
         });
+        // Chaque nouveau timestamp = nouvelle bougie dans LWC → incrémenter le compteur
+        if (cur.t !== _vmc2LwcLastBarT) { _vmc2LwcLen++; _vmc2LwcLastBarT = cur.t; }
       } catch(e) {}
     }
     // P&L + TP/SL : toujours actif même si WS tarde (utilise last known price)
